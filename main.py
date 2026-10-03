@@ -14,6 +14,7 @@ from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageTk
 
 import converter_engine as ce
 
@@ -42,6 +43,23 @@ EXT_MAP = {
 }
 
 NO_QUALITY_TARGETS = {"BMP", "ICO", "MP3", "WAV", "PNG", "GIF"}
+
+PREVIEW_CACHE_SIZE = 220   # thumbnail resolution kept in memory per file
+ROW_ICON_SIZE = 28         # small icon shown in the file list
+PREVIEW_BOX = (200, 128)   # the bigger preview panel's fixed display size
+
+
+def _compose_boxed(img: Image.Image, box_w: int, box_h: int, bg=(18, 19, 26)) -> Image.Image:
+    """Center img inside a fixed box_w x box_h canvas, preserving aspect
+    ratio, so the preview panel is a consistent size no matter the source's
+    shape (portrait photo, widescreen video, square icon, ...)."""
+    canvas = Image.new("RGB", (box_w, box_h), bg)
+    thumb = img.convert("RGB").copy()
+    thumb.thumbnail((box_w, box_h), Image.LANCZOS)
+    x = (box_w - thumb.width) // 2
+    y = (box_h - thumb.height) // 2
+    canvas.paste(thumb, (x, y))
+    return canvas
 
 
 def resource_path(name: str) -> str:
@@ -75,8 +93,8 @@ class ConverterApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("880x620")
-        self.root.minsize(760, 540)
+        self.root.geometry("900x700")
+        self.root.minsize(780, 600)
         self.root.configure(bg=BG)
 
         self.jobs: dict[str, Job] = {}
@@ -85,6 +103,16 @@ class ConverterApp:
         self.worker_thread: threading.Thread | None = None
         self.custom_out_dir: str | None = None
         self.ffmpeg_path = ce.find_ffmpeg()
+
+        # Preview state: preview_info holds the real PreviewInfo (thumbnail +
+        # dimensions/duration) per row; row_photo/preview_photo keep Tk
+        # PhotoImage objects alive (Tkinter drops images with no live Python
+        # reference, even while they're still on screen).
+        self.preview_info: dict[str, ce.PreviewInfo] = {}
+        self.row_photo: dict[str, ImageTk.PhotoImage] = {}
+        self.preview_photo: ImageTk.PhotoImage | None = None
+        self.thumb_queue: "queue.Queue[tuple[str, str, str]]" = queue.Queue()
+        threading.Thread(target=self._thumbnail_worker, daemon=True).start()
 
         self._build_style()
         self._build_layout()
@@ -129,7 +157,7 @@ class ConverterApp:
         style.configure("TProgressbar", background=ACCENT, troughcolor=PANEL, borderwidth=0)
         style.configure(
             "Treeview", background="#12131a", fieldbackground="#12131a",
-            foreground=TEXT, rowheight=26, borderwidth=0, font=("Segoe UI", 9),
+            foreground=TEXT, rowheight=36, borderwidth=0, font=("Segoe UI", 9),
         )
         style.configure("Treeview.Heading", background=PANEL, foreground=SUBTEXT, borderwidth=0)
         style.map("Treeview", background=[("selected", "#33415e")])
@@ -189,14 +217,20 @@ class ConverterApp:
         wrap.grid_columnconfigure(0, weight=1)
 
         columns = ("name", "type", "status")
-        self.tree = ttk.Treeview(wrap, columns=columns, show="headings", selectmode="extended")
+        # show="tree headings" keeps the normally-hidden "#0" column visible -
+        # that's the only column a ttk.Treeview can put a per-row image in,
+        # which is what makes the thumbnails next to each filename possible.
+        self.tree = ttk.Treeview(wrap, columns=columns, show="tree headings", selectmode="extended")
+        self.tree.heading("#0", text="")
+        self.tree.column("#0", width=46, minwidth=46, stretch=False, anchor="center")
         self.tree.heading("name", text="File")
         self.tree.heading("type", text="Type")
         self.tree.heading("status", text="Status")
-        self.tree.column("name", width=340, anchor="w")
+        self.tree.column("name", width=300, anchor="w")
         self.tree.column("type", width=70, anchor="center")
         self.tree.column("status", width=140, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
         scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -226,17 +260,38 @@ class ConverterApp:
     def _build_options(self, parent):
         parent.grid_columnconfigure(0, weight=1)
         pad = {"padx": 16, "pady": (12, 4)}
+        r = 0  # running row counter so inserting/reordering sections later is just editing, not renumbering everything
 
+        # ---- Preview -----------------------------------------------------
+        ttk.Label(parent, text="Preview", style="Panel.TLabel", font=("Segoe UI", 11, "bold")).grid(
+            row=r, column=0, sticky="w", **pad); r += 1
+
+        box = tk.Frame(parent, bg="#12131a", width=PREVIEW_BOX[0], height=PREVIEW_BOX[1],
+                        highlightthickness=1, highlightbackground="#3d4258")
+        box.grid(row=r, column=0, padx=16, sticky="w"); r += 1
+        box.grid_propagate(False)
+        self.preview_image_label = tk.Label(
+            box, bg="#12131a", fg=SUBTEXT, text="Select a file\nto preview",
+            font=("Segoe UI", 9), justify="center",
+        )
+        self.preview_image_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.preview_caption = ttk.Label(parent, text="", style="Sub.TLabel", wraplength=260, justify="left")
+        self.preview_caption.grid(row=r, column=0, sticky="w", padx=16, pady=(6, 0)); r += 1
+
+        ttk.Separator(parent, orient="horizontal").grid(row=r, column=0, sticky="ew", padx=16, pady=16); r += 1
+
+        # ---- Convert to ----------------------------------------------------
         ttk.Label(parent, text="Convert to", style="Panel.TLabel", font=("Segoe UI", 11, "bold")).grid(
-            row=0, column=0, sticky="w", **pad)
+            row=r, column=0, sticky="w", padx=16); r += 1
         self.target_var = tk.StringVar(value="")
         self.target_combo = ttk.Combobox(parent, textvariable=self.target_var, state="readonly")
-        self.target_combo.grid(row=1, column=0, sticky="ew", padx=16)
+        self.target_combo.grid(row=r, column=0, sticky="ew", padx=16); r += 1
         self.target_combo.bind("<<ComboboxSelected>>", lambda e: self._on_target_change())
 
         # Quality / lossless
         self.quality_frame = ttk.Frame(parent, style="Panel.TFrame")
-        self.quality_frame.grid(row=2, column=0, sticky="ew", padx=16, pady=(14, 0))
+        self.quality_frame.grid(row=r, column=0, sticky="ew", padx=16, pady=(14, 0)); r += 1
         self.quality_frame.grid_columnconfigure(0, weight=1)
 
         self.lossless_var = tk.BooleanVar(value=False)
@@ -261,24 +316,43 @@ class ConverterApp:
         self.combine_pdf_var = tk.BooleanVar(value=True)
         self.combine_pdf_check = ttk.Checkbutton(
             parent, text="Combine all images into one PDF", variable=self.combine_pdf_var,
+            command=self._on_combine_toggle,
         )
+        combine_row = r; r += 1
 
-        ttk.Separator(parent, orient="horizontal").grid(row=4, column=0, sticky="ew", padx=16, pady=16)
+        ttk.Separator(parent, orient="horizontal").grid(row=r, column=0, sticky="ew", padx=16, pady=16); r += 1
 
-        # Output location
+        # ---- Output location -----------------------------------------------
         ttk.Label(parent, text="Save converted files to", style="Panel.TLabel", font=("Segoe UI", 11, "bold")).grid(
-            row=5, column=0, sticky="w", padx=16)
+            row=r, column=0, sticky="w", padx=16); r += 1
         self.out_mode_var = tk.StringVar(value="alongside")
         ttk.Radiobutton(
             parent, text="A 'converted' subfolder next to each file", value="alongside",
             variable=self.out_mode_var, command=self._on_out_mode_change,
-        ).grid(row=6, column=0, sticky="w", padx=16, pady=(6, 0))
+        ).grid(row=r, column=0, sticky="w", padx=16, pady=(6, 0)); r += 1
         ttk.Radiobutton(
             parent, text="Choose a folder…", value="custom",
             variable=self.out_mode_var, command=self._on_out_mode_change,
-        ).grid(row=7, column=0, sticky="w", padx=16, pady=(4, 0))
+        ).grid(row=r, column=0, sticky="w", padx=16, pady=(4, 0)); r += 1
+        self.overwrite_radio = ttk.Radiobutton(
+            parent, text="Overwrite the original files", value="overwrite",
+            variable=self.out_mode_var, command=self._on_out_mode_change,
+        )
+        self.overwrite_radio.grid(row=r, column=0, sticky="w", padx=16, pady=(4, 0)); r += 1
+        self.overwrite_warning = ttk.Label(
+            parent, text="⚠ Replaces your original files. This can't be undone.",
+            style="Sub.TLabel", foreground=BAD, wraplength=260, justify="left",
+        )
+        self.overwrite_warning.grid(row=r, column=0, sticky="w", padx=16, pady=(4, 0)); r += 1
+        self.overwrite_warning.grid_remove()
         self.out_dir_label = ttk.Label(parent, text="", style="Sub.TLabel", wraplength=260, justify="left")
-        self.out_dir_label.grid(row=8, column=0, sticky="w", padx=16, pady=(4, 0))
+        self.out_dir_label.grid(row=r, column=0, sticky="w", padx=16, pady=(4, 0)); r += 1
+
+        # the combine-pdf checkbox is placed last so its row is below the
+        # quality section regardless of how many rows preview/options take
+        self._combine_pdf_row = combine_row
+        self.combine_pdf_check.grid(row=combine_row, column=0, sticky="w", padx=16, pady=(0, 4))
+        self.combine_pdf_check.grid_remove()
 
     def _build_action_bar(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -340,9 +414,11 @@ class ConverterApp:
             self.quality_note.configure(text="")
 
         if target == "PDF":
-            self.combine_pdf_check.grid(row=3, column=0, sticky="w", padx=16, pady=(0, 4))
+            self.combine_pdf_check.grid(row=self._combine_pdf_row, column=0, sticky="w", padx=16, pady=(0, 4))
         else:
             self.combine_pdf_check.grid_remove()
+
+        self._update_overwrite_lock()
 
     def _on_lossless_toggle(self):
         self._on_target_change()
@@ -350,8 +426,22 @@ class ConverterApp:
     def _on_quality_change(self, _value):
         self.quality_label.configure(text=f"Quality: {int(self.quality_var.get())}")
 
+    def _on_combine_toggle(self):
+        self._update_overwrite_lock()
+
+    def _update_overwrite_lock(self):
+        """Overwriting doesn't make sense when several images are being
+        merged into one combined PDF - there's no single original to
+        replace - so that combo is disabled rather than silently ignored."""
+        combining = self.target_var.get().upper() == "PDF" and self.combine_pdf_var.get()
+        self.overwrite_radio.configure(state="disabled" if combining else "normal")
+        if combining and self.out_mode_var.get() == "overwrite":
+            self.out_mode_var.set("alongside")
+            self.overwrite_warning.grid_remove()
+
     def _on_out_mode_change(self):
-        if self.out_mode_var.get() == "custom":
+        mode = self.out_mode_var.get()
+        if mode == "custom":
             chosen = filedialog.askdirectory(title="Choose output folder")
             if chosen:
                 self.custom_out_dir = chosen
@@ -361,6 +451,11 @@ class ConverterApp:
                 self.out_dir_label.configure(text="")
         else:
             self.out_dir_label.configure(text="")
+
+        if mode == "overwrite":
+            self.overwrite_warning.grid()
+        else:
+            self.overwrite_warning.grid_remove()
 
     # --------------------------------------------------------------- queue
     def _on_drop(self, event):
@@ -391,31 +486,125 @@ class ConverterApp:
             kind = ce.classify(p)
             if kind == "unknown":
                 continue
-            row_id = self.tree.insert("", "end", values=(os.path.basename(p), kind, "Queued"))
+            row_id = self.tree.insert("", "end", text="", values=(os.path.basename(p), kind, "Queued"))
             self.jobs[p] = Job(src=p, kind=kind, row_id=row_id)
+            self._queue_thumbnail(row_id, p, kind)
             added += 1
         if added:
             self._refresh_target_options()
             self._update_queue_count()
+
+    def _forget_preview(self, row_id: str):
+        self.preview_info.pop(row_id, None)
+        self.row_photo.pop(row_id, None)
 
     def remove_selected(self):
         for row_id in self.tree.selection():
             src = next((s for s, j in self.jobs.items() if j.row_id == row_id), None)
             if src:
                 del self.jobs[src]
+            self._forget_preview(row_id)
             self.tree.delete(row_id)
         self._refresh_target_options()
         self._update_queue_count()
+        self._update_preview_panel()
 
     def clear_all(self):
         self.tree.delete(*self.tree.get_children())
         self.jobs.clear()
+        self.preview_info.clear()
+        self.row_photo.clear()
         self._refresh_target_options()
         self._update_queue_count()
+        self._update_preview_panel()
 
     def _update_queue_count(self):
         n = len(self.jobs)
         self.queue_count_label.configure(text=f"{n} file{'s' if n != 1 else ''} queued")
+
+    # --------------------------------------------------------------- preview
+    def _thumbnail_worker(self):
+        """Runs forever on a background thread. Generating a thumbnail means
+        decoding an image or running ffmpeg to grab a video frame - both too
+        slow to do on the GUI thread without the window freezing, especially
+        when a dozen files just got dropped at once."""
+        while True:
+            row_id, src, kind = self.thumb_queue.get()
+            info = ce.generate_preview(src, kind, ffmpeg_path=self.ffmpeg_path, max_size=PREVIEW_CACHE_SIZE)
+            self.msg_queue.put(("thumb_ready", row_id, info))
+
+    def _queue_thumbnail(self, row_id: str, src: str, kind: str):
+        self.thumb_queue.put((row_id, src, kind))
+
+    def _on_tree_select(self, _event=None):
+        self._update_preview_panel()
+
+    def _file_size_label(self, path: str) -> str | None:
+        try:
+            return human_size(os.path.getsize(path))
+        except OSError:
+            return None
+
+    def _set_preview_placeholder(self, text: str):
+        self.preview_image_label.configure(image="", text=text)
+        self.preview_photo = None
+
+    def _update_preview_panel(self):
+        sel = self.tree.selection()
+        if len(sel) == 0:
+            self._set_preview_placeholder("Select a file\nto preview")
+            self.preview_caption.configure(text="")
+            return
+        if len(sel) > 1:
+            self._set_preview_placeholder(f"{len(sel)} files\nselected")
+            self.preview_caption.configure(text="")
+            return
+
+        row_id = sel[0]
+        src = next((s for s, j in self.jobs.items() if j.row_id == row_id), None)
+        if not src:
+            return
+
+        info = self.preview_info.get(row_id)
+        if info is None:
+            self._set_preview_placeholder("Loading preview…")
+            self.preview_caption.configure(text=os.path.basename(src))
+            return
+        if info.image is None:
+            self._set_preview_placeholder("No preview\navailable")
+        else:
+            boxed = _compose_boxed(info.image, *PREVIEW_BOX)
+            photo = ImageTk.PhotoImage(boxed)
+            self.preview_photo = photo  # keep a reference alive - Tk drops GC'd images
+            self.preview_image_label.configure(image=photo, text="")
+
+        meta_bits = []
+        if info.width and info.height:
+            meta_bits.append(f"{info.width} × {info.height}")
+        if info.duration:
+            m_, s_ = divmod(int(info.duration), 60)
+            meta_bits.append(f"{m_}:{s_:02d}")
+        size_label = self._file_size_label(src)
+        if size_label:
+            meta_bits.append(size_label)
+        caption = os.path.basename(src)
+        if meta_bits:
+            caption += "\n" + "  ·  ".join(meta_bits)
+        self.preview_caption.configure(text=caption)
+
+    def _apply_thumbnail(self, row_id: str, info: "ce.PreviewInfo"):
+        """Runs on the main thread (called from _poll_queue). Creating a
+        Tk PhotoImage must happen here, never on the background thread that
+        generated the underlying PIL image."""
+        self.preview_info[row_id] = info
+        if info.image is not None and self.tree.exists(row_id):
+            icon = info.image.copy()
+            icon.thumbnail((ROW_ICON_SIZE, ROW_ICON_SIZE), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(icon)
+            self.row_photo[row_id] = photo  # keep alive, same reason as preview_photo
+            self.tree.item(row_id, image=photo)
+        if row_id in self.tree.selection():
+            self._update_preview_panel()
 
     # ---------------------------------------------------------- conversion
     def _start_conversion(self):
@@ -426,6 +615,18 @@ class ConverterApp:
         if not target:
             messagebox.showinfo(APP_TITLE, "Choose an output format.")
             return
+
+        if self.out_mode_var.get() == "overwrite":
+            n = len(self.jobs)
+            proceed = messagebox.askyesno(
+                APP_TITLE,
+                f"This will replace {n} original file{'s' if n != 1 else ''} with "
+                "the converted version, permanently. This can't be undone.\n\n"
+                "Continue?",
+                icon="warning",
+            )
+            if not proceed:
+                return
 
         self.cancel_event.clear()
         self.convert_btn.configure(state="disabled")
@@ -501,6 +702,8 @@ class ConverterApp:
             self.msg_queue.put(("finished", last_out_dir))
             return
 
+        overwrite = (out_mode == "overwrite")
+
         for job in jobs:
             if is_cancelled():
                 self.msg_queue.put(("job_status", job.row_id, "Cancelled"))
@@ -508,50 +711,77 @@ class ConverterApp:
                 continue
 
             self.msg_queue.put(("job_status", job.row_id, "Converting…"))
-            try:
-                out_dir = self._resolve_out_dir(job.src, out_mode, custom_dir)
-                out_path = ce.unique_path(out_dir / f"{Path(job.src).stem}.{ext}")
-                last_out_dir = str(out_dir)
+            src_path = Path(job.src)
+            # Overwrite mode NEVER converts in place. It writes the full
+            # result to a temp file next to the original first; only once
+            # that's verified to exist does it delete the original and move
+            # the temp file into place. A failed/cancelled run below simply
+            # never reaches that step, so the original is untouched.
+            if overwrite:
+                work_dir = src_path.parent
+                temp_path = work_dir / f"~converting_{src_path.stem}.{ext}"
+            else:
+                work_dir = self._resolve_out_dir(job.src, out_mode, custom_dir)
+                temp_path = ce.unique_path(work_dir / f"{src_path.stem}.{ext}")
+            last_out_dir = str(work_dir)
 
+            try:
                 if target_up == "PDF":
                     if job.kind != "image":
                         raise RuntimeError("only images can be converted to PDF")
-                    ce.images_to_pdf([job.src], str(out_path), lossless=lossless, quality=quality)
+                    ce.images_to_pdf([job.src], str(temp_path), lossless=lossless, quality=quality)
 
                 elif job.kind == "image" and target_up != "PDF":
                     if target_up in ce.VIDEO_TARGETS and target_up not in ce.IMAGE_TARGETS:
                         raise RuntimeError(f"can't convert an image to {target_up}")
-                    ce.convert_image(job.src, str(out_path), target_up, quality=quality,
+                    ce.convert_image(job.src, str(temp_path), target_up, quality=quality,
                                       lossless=lossless, log=lambda m: self.msg_queue.put(("log", m)))
 
                 elif job.kind == "video":
                     if target_up in ce.IMAGE_TARGETS and target_up not in ce.VIDEO_TARGETS:
                         raise RuntimeError(f"can't convert a video to {target_up}")
 
-                    def progress_cb(frac, _job=job, _done=done, _total=total):
+                    def progress_cb(frac, _done=done, _total=total):
                         overall = (_done + frac) / _total * 100
                         self.msg_queue.put(("progress", overall))
 
-                    ce.convert_video(self.ffmpeg_path, job.src, str(out_path), target_up,
+                    ce.convert_video(self.ffmpeg_path, job.src, str(temp_path), target_up,
                                       quality=quality, lossless=lossless,
                                       progress_cb=progress_cb, is_cancelled=is_cancelled)
                 else:
                     raise RuntimeError("unsupported conversion")
 
-                size = human_size(out_path.stat().st_size) if out_path.exists() else "?"
+                if overwrite:
+                    final_path = Path(ce.finalize_overwrite(str(temp_path), job.src, ext))
+                else:
+                    final_path = temp_path
+
+                size = human_size(final_path.stat().st_size) if final_path.exists() else "?"
                 self.msg_queue.put(("job_status", job.row_id, "Done"))
-                self.msg_queue.put(("log", f"{os.path.basename(job.src)} -> {out_path.name} ({size})"))
+                self.msg_queue.put(("log", f"{os.path.basename(job.src)} -> {final_path.name} ({size})"))
 
             except ce.ConversionCancelled:
                 self.msg_queue.put(("job_status", job.row_id, "Cancelled"))
+                self._cleanup_temp(overwrite, temp_path)
             except Exception as exc:
                 self.msg_queue.put(("job_status", job.row_id, "Error"))
                 self.msg_queue.put(("log", f"Failed: {os.path.basename(job.src)} - {exc}"))
+                self._cleanup_temp(overwrite, temp_path)
 
             done += 1
             self.msg_queue.put(("progress", done / total * 100))
 
         self.msg_queue.put(("finished", last_out_dir))
+
+    @staticmethod
+    def _cleanup_temp(overwrite: bool, temp_path: Path):
+        """On a failed or cancelled overwrite-mode conversion, remove the
+        partial temp file so it doesn't linger next to the original."""
+        if overwrite:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     # ---------------------------------------------------------------- poll
     def _poll_queue(self):
@@ -570,6 +800,8 @@ class ConverterApp:
                     self.status_label.configure(text=msg[1])
                 elif kind == "finished":
                     self._on_finished(msg[1])
+                elif kind == "thumb_ready":
+                    self._apply_thumbnail(msg[1], msg[2])
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
