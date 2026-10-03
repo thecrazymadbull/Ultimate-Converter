@@ -13,6 +13,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -129,6 +131,27 @@ def unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         i += 1
+
+
+def finalize_overwrite(temp_path: str, src_path: str, dst_ext: str) -> str:
+    """After a conversion has been written safely to temp_path, replace the
+    original src_path with it. The original is only ever removed once the
+    full converted file already exists on disk - a failed or cancelled
+    conversion never touches the original.
+
+    If dst_ext differs from the source's extension, the old file is deleted
+    and the new one takes its place (same folder, same base name, new
+    extension). Returns the final path as a string."""
+    src = Path(src_path)
+    final = src.with_suffix(f".{dst_ext}")
+    if final != src and final.exists():
+        final = unique_path(final)
+    try:
+        src.unlink()
+    except FileNotFoundError:
+        pass
+    Path(temp_path).replace(final)
+    return str(final)
 
 
 def _quality_to_crf(quality: int, lo: int, hi: int) -> int:
@@ -402,3 +425,71 @@ def convert_video(
         )
     if progress_cb:
         progress_cb(1.0)
+
+
+# --------------------------------------------------------------------------
+# Previews - a small in-memory thumbnail plus basic info, so the GUI can
+# show "what you're about to convert" before you commit to it.
+# --------------------------------------------------------------------------
+_RESOLUTION_RE = re.compile(r",\s*(\d{2,5})x(\d{2,5})[ ,]")
+
+
+@dataclass
+class PreviewInfo:
+    image: Optional[Image.Image] = None  # small RGB thumbnail, or None if unavailable
+    width: Optional[int] = None          # the SOURCE file's real dimensions,
+    height: Optional[int] = None         # not the (possibly smaller) thumbnail's
+    duration: Optional[float] = None     # seconds; video only
+
+
+def generate_preview(
+    src: str,
+    kind: str,
+    ffmpeg_path: Optional[str] = None,
+    max_size: int = 220,
+) -> PreviewInfo:
+    """Best-effort preview. Never raises - on any failure (corrupt file,
+    unsupported codec, missing ffmpeg) it just returns an empty PreviewInfo
+    so the GUI can show "no preview available" instead of crashing."""
+    try:
+        if kind == "image":
+            with Image.open(src) as im:
+                w, h = im.size
+                thumb = im.convert("RGBA" if "A" in im.mode else "RGB")
+                thumb.thumbnail((max_size, max_size), Image.LANCZOS)
+                return PreviewInfo(image=thumb.copy(), width=w, height=h)
+
+        elif kind == "video" and ffmpeg_path:
+            with tempfile.TemporaryDirectory() as td:
+                out_path = os.path.join(td, "thumb.jpg")
+                # One ffmpeg call does double duty: its stderr/stdout carries the
+                # input's resolution & duration (same as every other ffmpeg run),
+                # and -vframes 1 grabs a representative frame half a second in.
+                proc = subprocess.run(
+                    [
+                        ffmpeg_path, "-y", "-ss", "0.5", "-i", src, "-vframes", "1",
+                        "-vf", f"scale='min({max_size},iw)':-1", out_path,
+                    ],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    timeout=15, creationflags=_NO_WINDOW,
+                )
+                out_text = proc.stdout or ""
+                dur = None
+                m = _DURATION_RE.search(out_text)
+                if m:
+                    dur = _hms(*m.groups())
+                w = h = None
+                rm = _RESOLUTION_RE.search(out_text)
+                if rm:
+                    w, h = int(rm.group(1)), int(rm.group(2))
+
+                img = None
+                if os.path.exists(out_path):
+                    with Image.open(out_path) as im:
+                        im = im.convert("RGB")
+                        im.load()
+                        img = im.copy()
+                return PreviewInfo(image=img, width=w, height=h, duration=dur)
+    except Exception:
+        pass
+    return PreviewInfo()
