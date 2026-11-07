@@ -1,4 +1,6 @@
-"""
+def rotate_image(im: Image.Image, angle: int = 90) -> Image.Image:
+    """Rotate an image by the specified angle (default: 90° clockwise)."""
+    return im.rotate(angle, expand=True)"""
 Ultimate Converter - conversion engine.
 
 All the actual file-conversion logic lives here, completely independent of
