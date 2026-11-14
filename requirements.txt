@@ -4,3 +4,4 @@ pillow-heif>=0.15.0
 img2pdf>=0.5.1
 tkinterdnd2>=0.3.0
 pyinstaller>=6.3.0
+send2trash>=1.8.0

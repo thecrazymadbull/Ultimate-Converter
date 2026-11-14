@@ -8,6 +8,7 @@ converter without touching any Tkinter code.
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import shutil
@@ -36,6 +37,13 @@ try:
     HAS_HEIF = True
 except ImportError:
     HAS_HEIF = False
+
+try:
+    from send2trash import send2trash as _send2trash  # moves files to the Recycle Bin
+    HAS_TRASH = True
+except ImportError:
+    _send2trash = None
+    HAS_TRASH = False
 
 import img2pdf
 
@@ -133,23 +141,94 @@ def unique_path(path: Path) -> Path:
         i += 1
 
 
-def finalize_overwrite(temp_path: str, src_path: str, dst_ext: str) -> str:
+def natural_key(path: str) -> list:
+    """Sort key that orders 'scan2.jpg' before 'scan10.jpg' (and ignores case),
+    so a batch dropped in one go lands in the order a person expects."""
+    parts = re.split(r"(\d+)", path.lower())
+    # re.split with a capture group alternates text, number, text, ... so
+    # odd positions are always digits and the lists compare cleanly.
+    return [int(t) if i % 2 else t for i, t in enumerate(parts)]
+
+
+_BAD_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL",
+                   *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def safe_filename(name: str, default: str = "combined") -> str:
+    """Turn whatever the user typed into a safe Windows file name, without
+    extension. Falls back to `default` if nothing usable is left."""
+    name = _BAD_FILENAME_CHARS.sub("", name or "").strip()
+    if name.lower().endswith(".pdf"):
+        name = name[:-4]
+    name = name.strip().strip(".").strip()
+    if name.upper() in _RESERVED_NAMES:
+        name += "_"
+    return name[:120] or default
+
+
+# --------------------------------------------------------------------------
+# Remembered settings (last format, quality, etc.)
+# --------------------------------------------------------------------------
+def settings_path() -> Path:
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return Path(base) / "UltimateConverter" / "settings.json"
+
+
+def load_settings() -> dict:
+    """Never raises: a missing or damaged file just means 'use the defaults'."""
+    try:
+        data = json.loads(settings_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    """Best effort - failing to remember a setting must never break the app."""
+    try:
+        path = settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def finalize_overwrite(temp_path: str, src_path: str, dst_ext: str, recycle: bool = False) -> str:
     """After a conversion has been written safely to temp_path, replace the
     original src_path with it. The original is only ever removed once the
     full converted file already exists on disk - a failed or cancelled
     conversion never touches the original.
 
-    If dst_ext differs from the source's extension, the old file is deleted
-    and the new one takes its place (same folder, same base name, new
-    extension). Returns the final path as a string."""
+    With recycle=True the original goes to the Recycle Bin (so it can be
+    restored) instead of being deleted for good. If that isn't possible this
+    raises BEFORE touching anything - it never quietly falls back to a
+    permanent delete the person didn't choose.
+
+    If dst_ext differs from the source's extension, the old file is replaced
+    by one with the same base name and the new extension. Returns the final
+    path as a string."""
     src = Path(src_path)
     final = src.with_suffix(f".{dst_ext}")
     if final != src and final.exists():
         final = unique_path(final)
-    try:
-        src.unlink()
-    except FileNotFoundError:
-        pass
+    if recycle:
+        if not HAS_TRASH or _send2trash is None:
+            raise RuntimeError("Recycle Bin support isn't available in this build.")
+        if src.exists():
+            try:
+                _send2trash(str(src))
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Couldn't move the original to the Recycle Bin ({exc}). It was left untouched."
+                ) from exc
+    else:
+        try:
+            src.unlink()
+        except FileNotFoundError:
+            pass
     Path(temp_path).replace(final)
     return str(final)
 
@@ -294,21 +373,42 @@ def _image_payload(path: str, lossless: bool, quality: int, rotation: int = 0) -
         return buf.getvalue()
 
 
+# Page sizes offered for PDF output, in millimetres. None means every page is
+# sized to match its own image (the original behaviour).
+PDF_PAGE_SIZES = {"Match each image": None, "A4": (210.0, 297.0), "Letter": (215.9, 279.4)}
+PDF_PAGE_DEFAULT = "Match each image"
+PDF_PAGE_MARGIN_MM = 10
+
+
 def images_to_pdf(
     paths: list[str],
     dst: str,
     lossless: bool = True,
     quality: int = 85,
     rotations: Optional[list[int]] = None,
+    page_size: Optional[str] = None,
 ) -> None:
-    """Combine one or more images into a single PDF file. `rotations`, if
-    given, holds one clockwise angle (0/90/180/270) per image."""
+    """Combine one or more images into a single PDF, one image per page, in
+    the order given. `rotations`, if given, holds one clockwise angle
+    (0/90/180/270) per image. `page_size` is a key of PDF_PAGE_SIZES: for a
+    fixed size every image is fitted inside the page with a margin (the page
+    turns landscape for a wide picture), otherwise each page matches its image."""
     payloads = [
         _image_payload(p, lossless, quality, rotations[i] if rotations else 0)
         for i, p in enumerate(paths)
     ]
+    kwargs = {}
+    dims = PDF_PAGE_SIZES.get(page_size or PDF_PAGE_DEFAULT)
+    if dims:
+        margin = img2pdf.mm_to_pt(PDF_PAGE_MARGIN_MM)
+        kwargs["layout_fun"] = img2pdf.get_layout_fun(
+            (img2pdf.mm_to_pt(dims[0]), img2pdf.mm_to_pt(dims[1])),
+            border=(margin, margin),
+            fit=img2pdf.FitMode.into,
+            auto_orient=True,
+        )
     with open(dst, "wb") as f:
-        f.write(img2pdf.convert(payloads))
+        f.write(img2pdf.convert(payloads, **kwargs))
 
 
 # --------------------------------------------------------------------------

@@ -27,6 +27,7 @@ except ImportError:
     HAS_DND = False
 
 APP_TITLE = "Ultimate Converter"
+APP_VERSION = "1.2"  # shown in the window title and header - bump this on each release
 BG = "#1e1f26"
 PANEL = "#262833"
 ACCENT = "#5b8cff"
@@ -97,7 +98,7 @@ class Job:
 class ConverterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(APP_TITLE)
+        self.root.title(f"{APP_TITLE} {APP_VERSION}")
         self.root.geometry("900x700")
         self.root.minsize(780, 600)
         self.root.configure(bg=BG)
@@ -122,6 +123,7 @@ class ConverterApp:
 
         self._build_style()
         self._build_layout()
+        self._apply_settings(ce.load_settings())
         self._refresh_target_options()
         self._poll_queue()
 
@@ -145,6 +147,7 @@ class ConverterApp:
         style.configure("Panel.TLabel", background=PANEL, foreground=TEXT, font=("Segoe UI", 10))
         style.configure("Sub.TLabel", background=PANEL, foreground=SUBTEXT, font=("Segoe UI", 9))
         style.configure("Title.TLabel", background=BG, foreground=TEXT, font=("Segoe UI", 15, "bold"))
+        style.configure("Version.TLabel", background=BG, foreground=SUBTEXT, font=("Segoe UI", 10))
         style.configure("TCheckbutton", background=PANEL, foreground=TEXT, font=("Segoe UI", 10))
         style.map("TCheckbutton", background=[("active", PANEL)])
         style.configure("TRadiobutton", background=PANEL, foreground=TEXT, font=("Segoe UI", 10))
@@ -187,6 +190,7 @@ class ConverterApp:
         header = ttk.Frame(root, style="TFrame")
         header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(14, 6))
         ttk.Label(header, text="🔁  Ultimate Converter", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text=f"v{APP_VERSION}", style="Version.TLabel").pack(side="left", padx=(10, 0), pady=(6, 0))
 
         left = ttk.Frame(root, style="TFrame")
         left.grid(row=1, column=0, sticky="nsew", padx=(16, 8), pady=8)
@@ -261,6 +265,11 @@ class ConverterApp:
         row2.grid(row=2, column=0, sticky="ew")
         ttk.Button(row2, text="Remove selected", style="Flat.TButton", command=self.remove_selected).pack(side="left")
         ttk.Button(row2, text="Clear all", style="Flat.TButton", command=self.clear_all).pack(side="left", padx=6)
+        # Order matters for a combined PDF: pages follow the list from top to bottom.
+        ttk.Button(row2, text="▲ Up", style="Flat.TButton", width=6,
+                   command=lambda: self._move_selected(-1)).pack(side="left", padx=(6, 0))
+        ttk.Button(row2, text="▼ Down", style="Flat.TButton", width=7,
+                   command=lambda: self._move_selected(1)).pack(side="left", padx=(2, 0))
         self.queue_count_label = ttk.Label(row2, text="0 files queued", style="TLabel")
         self.queue_count_label.pack(side="right")
 
@@ -345,12 +354,31 @@ class ConverterApp:
         self.quality_note = ttk.Label(self.quality_frame, text="", style="Sub.TLabel", wraplength=260, justify="left")
         self.quality_note.grid(row=3, column=0, sticky="w", pady=(6, 0))
 
-        # PDF-only option
+        # PDF-only options (shown only when the target is PDF)
+        self.pdf_frame = ttk.Frame(parent, style="Panel.TFrame")
+        self.pdf_frame.grid_columnconfigure(0, weight=1)
         self.combine_pdf_var = tk.BooleanVar(value=True)
         self.combine_pdf_check = ttk.Checkbutton(
-            parent, text="Combine all images into one PDF", variable=self.combine_pdf_var,
+            self.pdf_frame, text="Combine all images into one PDF", variable=self.combine_pdf_var,
             command=self._on_combine_toggle,
         )
+        self.combine_pdf_check.grid(row=0, column=0, sticky="w")
+        self.pdf_hint = ttk.Label(
+            self.pdf_frame, text="Pages follow the list order - use ▲ Up / ▼ Down to rearrange.",
+            style="Sub.TLabel", wraplength=260, justify="left",
+        )
+        self.pdf_hint.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(self.pdf_frame, text="File name", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.pdf_name_var = tk.StringVar(value="combined")
+        self.pdf_name_entry = ttk.Entry(self.pdf_frame, textvariable=self.pdf_name_var)
+        self.pdf_name_entry.grid(row=3, column=0, sticky="ew", pady=(2, 0))
+        ttk.Label(self.pdf_frame, text="Page size", style="Panel.TLabel").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.page_size_var = tk.StringVar(value=ce.PDF_PAGE_DEFAULT)
+        self.page_size_combo = ttk.Combobox(
+            self.pdf_frame, textvariable=self.page_size_var, state="readonly",
+            values=list(ce.PDF_PAGE_SIZES.keys()),
+        )
+        self.page_size_combo.grid(row=5, column=0, sticky="ew", pady=(2, 0))
         combine_row = r; r += 1
 
         ttk.Separator(parent, orient="horizontal").grid(row=r, column=0, sticky="ew", padx=16, pady=16); r += 1
@@ -373,19 +401,25 @@ class ConverterApp:
         )
         self.overwrite_radio.grid(row=r, column=0, sticky="w", padx=16, pady=(4, 0)); r += 1
         self.overwrite_warning = ttk.Label(
-            parent, text="⚠ Replaces your original files. This can't be undone.",
-            style="Sub.TLabel", foreground=BAD, wraplength=260, justify="left",
+            parent, text="", style="Sub.TLabel", foreground=BAD, wraplength=260, justify="left",
         )
         self.overwrite_warning.grid(row=r, column=0, sticky="w", padx=16, pady=(4, 0)); r += 1
         self.overwrite_warning.grid_remove()
+        self.recycle_var = tk.BooleanVar(value=True)
+        self.recycle_check = ttk.Checkbutton(
+            parent, text="Move originals to the Recycle Bin (recommended)",
+            variable=self.recycle_var, command=self._update_overwrite_warning,
+        )
+        self.recycle_check.grid(row=r, column=0, sticky="w", padx=16, pady=(4, 0)); r += 1
+        self.recycle_check.grid_remove()
         self.out_dir_label = ttk.Label(parent, text="", style="Sub.TLabel", wraplength=260, justify="left")
         self.out_dir_label.grid(row=r, column=0, sticky="w", padx=16, pady=(4, 0)); r += 1
 
-        # the combine-pdf checkbox is placed last so its row is below the
+        # the PDF options frame is placed last so its row is below the
         # quality section regardless of how many rows preview/options take
         self._combine_pdf_row = combine_row
-        self.combine_pdf_check.grid(row=combine_row, column=0, sticky="w", padx=16, pady=(0, 4))
-        self.combine_pdf_check.grid_remove()
+        self.pdf_frame.grid(row=combine_row, column=0, sticky="ew", padx=16, pady=(10, 4))
+        self.pdf_frame.grid_remove()
 
     def _build_action_bar(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -447,9 +481,9 @@ class ConverterApp:
             self.quality_note.configure(text="")
 
         if target == "PDF":
-            self.combine_pdf_check.grid(row=self._combine_pdf_row, column=0, sticky="w", padx=16, pady=(0, 4))
+            self.pdf_frame.grid(row=self._combine_pdf_row, column=0, sticky="ew", padx=16, pady=(10, 4))
         else:
-            self.combine_pdf_check.grid_remove()
+            self.pdf_frame.grid_remove()
 
         self._update_overwrite_lock()
 
@@ -468,9 +502,32 @@ class ConverterApp:
         replace - so that combo is disabled rather than silently ignored."""
         combining = self.target_var.get().upper() == "PDF" and self.combine_pdf_var.get()
         self.overwrite_radio.configure(state="disabled" if combining else "normal")
+        # the name box only matters when everything is joined into one file
+        self.pdf_name_entry.configure(state="normal" if combining else "disabled")
         if combining and self.out_mode_var.get() == "overwrite":
             self.out_mode_var.set("alongside")
+            self._update_overwrite_warning()
+
+    def _update_overwrite_warning(self):
+        """Show/hide the overwrite warning and the Recycle Bin tick box, with
+        wording that matches what will really happen to the originals."""
+        if self.out_mode_var.get() != "overwrite":
             self.overwrite_warning.grid_remove()
+            self.recycle_check.grid_remove()
+            return
+        if ce.HAS_TRASH:
+            self.recycle_check.grid()
+            if self.recycle_var.get():
+                self.overwrite_warning.configure(
+                    text="Originals go to the Recycle Bin, so you can still restore them.", foreground=SUBTEXT)
+            else:
+                self.overwrite_warning.configure(
+                    text="⚠ Originals are deleted permanently. This can't be undone.", foreground=BAD)
+        else:
+            self.recycle_check.grid_remove()
+            self.overwrite_warning.configure(
+                text="⚠ Replaces your original files. This can't be undone.", foreground=BAD)
+        self.overwrite_warning.grid()
 
     def _on_out_mode_change(self):
         mode = self.out_mode_var.get()
@@ -485,10 +542,7 @@ class ConverterApp:
         else:
             self.out_dir_label.configure(text="")
 
-        if mode == "overwrite":
-            self.overwrite_warning.grid()
-        else:
-            self.overwrite_warning.grid_remove()
+        self._update_overwrite_warning()
 
     # --------------------------------------------------------------- queue
     def _on_drop(self, event):
@@ -512,8 +566,8 @@ class ConverterApp:
 
     def add_files(self, paths: list[str]):
         added = 0
-        for p in paths:
-            p = os.path.normpath(p)
+        # natural order: scan2 before scan10 (matters for page order in a PDF)
+        for p in sorted((os.path.normpath(x) for x in paths), key=ce.natural_key):
             if not os.path.isfile(p) or p in self.jobs:
                 continue
             kind = ce.classify(p)
@@ -550,6 +604,32 @@ class ConverterApp:
         self._refresh_target_options()
         self._update_queue_count()
         self._update_preview_panel()
+
+    def _ordered_jobs(self) -> list[Job]:
+        """Jobs in the order shown in the list (top to bottom) - this is the
+        page order of a combined PDF."""
+        ordered = [self._job_for_row(rid) for rid in self.tree.get_children()]
+        return [j for j in ordered if j is not None]
+
+    def _move_selected(self, direction: int):
+        """Move the selected rows one step up (-1) or down (+1), keeping
+        their relative order. Selected rows that are already at the edge stay put."""
+        if self.converting:
+            return
+        rows = list(self.tree.get_children())
+        selected = set(self.tree.selection())
+        if not selected:
+            return
+        order = rows[:]
+        indices = range(len(order)) if direction < 0 else range(len(order) - 1, -1, -1)
+        for i in indices:
+            j = i + direction
+            if order[i] in selected and 0 <= j < len(order) and order[j] not in selected:
+                order[i], order[j] = order[j], order[i]
+        if order == rows:
+            return
+        for idx, rid in enumerate(order):
+            self.tree.move(rid, "", idx)
 
     def _update_queue_count(self):
         n = len(self.jobs)
@@ -725,16 +805,17 @@ class ConverterApp:
             messagebox.showinfo(APP_TITLE, "Choose an output format.")
             return
 
+        recycle = bool(self.recycle_var.get() and ce.HAS_TRASH)
         if self.out_mode_var.get() == "overwrite":
             n = len(self.jobs)
-            proceed = messagebox.askyesno(
-                APP_TITLE,
-                f"This will replace {n} original file{'s' if n != 1 else ''} with "
-                "the converted version, permanently. This can't be undone.\n\n"
-                "Continue?",
-                icon="warning",
-            )
-            if not proceed:
+            what = f"{n} original file{'s' if n != 1 else ''}"
+            if recycle:
+                text = (f"This will replace {what} with the converted version. "
+                        "The originals are moved to the Recycle Bin.\n\nContinue?")
+            else:
+                text = (f"This will replace {what} with the converted version, "
+                        "permanently. This can't be undone.\n\nContinue?")
+            if not messagebox.askyesno(APP_TITLE, text, icon="warning"):
                 return
 
         self.cancel_event.clear()
@@ -756,9 +837,14 @@ class ConverterApp:
         out_mode = self.out_mode_var.get()
         custom_dir = self.custom_out_dir
 
+        pdf_name = ce.safe_filename(self.pdf_name_var.get())
+        page_size = self.page_size_var.get()  # a key of ce.PDF_PAGE_SIZES
+        self._save_settings()
+
         self.worker_thread = threading.Thread(
             target=self._worker,
-            args=(list(self.jobs.values()), target, quality, lossless, combine_pdf, out_mode, custom_dir),
+            args=(self._ordered_jobs(), target, quality, lossless, combine_pdf, out_mode, custom_dir),
+            kwargs=dict(recycle=recycle, pdf_name=pdf_name, page_size=page_size),
             daemon=True,
         )
         self.worker_thread.start()
@@ -776,7 +862,8 @@ class ConverterApp:
         return out_dir
 
     def _worker(self, jobs: list[Job], target: str, quality: int, lossless: bool,
-                combine_pdf: bool, out_mode: str, custom_dir: str | None):
+                combine_pdf: bool, out_mode: str, custom_dir: str | None,
+                recycle: bool = False, pdf_name: str = "combined", page_size=None):
         target_up = target.upper()
         ext = EXT_MAP.get(target_up, target_up.lower())
         total = len(jobs)
@@ -792,10 +879,10 @@ class ConverterApp:
             other_jobs = [j for j in jobs if j.kind != "image"]
             if len(image_jobs) >= 1:
                 out_dir = self._resolve_out_dir(image_jobs[0].src, out_mode, custom_dir)
-                out_path = ce.unique_path(out_dir / "combined.pdf")
+                out_path = ce.unique_path(out_dir / f"{ce.safe_filename(pdf_name)}.pdf")
                 try:
                     ce.images_to_pdf([j.src for j in image_jobs], str(out_path), lossless=lossless, quality=quality,
-                                     rotations=[j.rotation for j in image_jobs])
+                                     rotations=[j.rotation for j in image_jobs], page_size=page_size)
                     for j in image_jobs:
                         self.msg_queue.put(("job_status", j.row_id, "Done"))
                     self.msg_queue.put(("log", f"Combined {len(image_jobs)} image(s) -> {out_path.name}"))
@@ -842,7 +929,7 @@ class ConverterApp:
                     if job.kind != "image":
                         raise RuntimeError("only images can be converted to PDF")
                     ce.images_to_pdf([job.src], str(temp_path), lossless=lossless, quality=quality,
-                                     rotations=[job.rotation])
+                                     rotations=[job.rotation], page_size=page_size)
 
                 elif job.kind == "image" and target_up != "PDF":
                     if target_up in ce.VIDEO_TARGETS and target_up not in ce.IMAGE_TARGETS:
@@ -866,7 +953,7 @@ class ConverterApp:
                     raise RuntimeError("unsupported conversion")
 
                 if overwrite:
-                    final_path = Path(ce.finalize_overwrite(str(temp_path), job.src, ext))
+                    final_path = Path(ce.finalize_overwrite(str(temp_path), job.src, ext, recycle=recycle))
                     # the queue entry now has to describe the new file (see _on_overwritten)
                     self.msg_queue.put(("overwritten", job.row_id, job.src, str(final_path)))
                 else:
@@ -898,6 +985,65 @@ class ConverterApp:
                 temp_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------- settings
+    def _collect_settings(self) -> dict:
+        out_mode = self.out_mode_var.get()
+        if out_mode == "overwrite":
+            out_mode = "alongside"  # never start a session in a destructive mode
+        return {
+            "target": self.target_var.get(),
+            "lossless": bool(self.lossless_var.get()),
+            "quality": int(self.quality_var.get()),
+            "combine_pdf": bool(self.combine_pdf_var.get()),
+            "pdf_name": self.pdf_name_var.get(),
+            "page_size": self.page_size_var.get(),
+            "recycle": bool(self.recycle_var.get()),
+            "out_mode": out_mode,
+            "custom_dir": self.custom_out_dir,
+        }
+
+    def _apply_settings(self, data: dict):
+        """Restore remembered choices. Every value is validated, because the
+        file is user-editable and may come from another version."""
+        if not isinstance(data, dict):
+            return
+        try:
+            if isinstance(data.get("lossless"), bool):
+                self.lossless_var.set(data["lossless"])
+            q = data.get("quality")
+            if isinstance(q, int) and not isinstance(q, bool) and 1 <= q <= 100:
+                self.quality_var.set(q)
+                self.quality_label.configure(text=f"Quality: {q}")
+            if isinstance(data.get("combine_pdf"), bool):
+                self.combine_pdf_var.set(data["combine_pdf"])
+            if isinstance(data.get("pdf_name"), str):
+                self.pdf_name_var.set(data["pdf_name"])
+            if data.get("page_size") in ce.PDF_PAGE_SIZES:
+                self.page_size_var.set(data["page_size"])
+            if isinstance(data.get("recycle"), bool):
+                self.recycle_var.set(data["recycle"])
+            cd = data.get("custom_dir")
+            if isinstance(cd, str) and os.path.isdir(cd):
+                self.custom_out_dir = cd
+                if data.get("out_mode") == "custom":
+                    self.out_mode_var.set("custom")
+                    self.out_dir_label.configure(text=cd)
+            target = data.get("target")
+            if isinstance(target, str) and target in ce.ALL_TARGETS:
+                self.target_var.set(target)  # kept if still valid for the added files
+        except Exception:
+            pass  # a bad settings file must never stop the app starting
+
+    def _save_settings(self):
+        try:
+            ce.save_settings(self._collect_settings())
+        except Exception:
+            pass
+
+    def _on_close(self):
+        self._save_settings()
+        self.root.destroy()
 
     # ---------------------------------------------------------------- poll
     def _poll_queue(self):
@@ -957,7 +1103,7 @@ def main():
     except Exception:
         pass
     app = ConverterApp(root)
-    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.protocol("WM_DELETE_WINDOW", app._on_close)
     root.mainloop()
 
 
@@ -968,7 +1114,7 @@ if __name__ == "__main__":
         # A --windowed build has no console, so make sure a crash is visible.
         try:
             import tkinter.messagebox as mb
-            mb.showerror("Ultimate Converter - crashed", traceback.format_exc())
+            mb.showerror(f"Ultimate Converter {APP_VERSION} - crashed", traceback.format_exc())
         except Exception:
             pass
         raise
