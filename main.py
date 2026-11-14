@@ -80,6 +80,10 @@ def human_size(num_bytes: int) -> str:
     return f"{size:.1f} GB"
 
 
+# What the "Rotated" column shows for each clockwise angle
+ROTATION_LABELS = {0: "", 90: "↻ 90°", 180: "↻ 180°", 270: "↺ 90°"}
+
+
 @dataclass
 class Job:
     src: str
@@ -87,6 +91,7 @@ class Job:
     row_id: str = ""
     status: str = "Queued"
     out_path: str = ""
+    rotation: int = 0  # extra clockwise degrees (0/90/180/270); images only
 
 
 class ConverterApp:
@@ -103,6 +108,7 @@ class ConverterApp:
         self.worker_thread: threading.Thread | None = None
         self.custom_out_dir: str | None = None
         self.ffmpeg_path = ce.find_ffmpeg()
+        self.converting = False  # True while a batch runs (rotation is locked then)
 
         # Preview state: preview_info holds the real PreviewInfo (thumbnail +
         # dimensions/duration) per row; row_photo/preview_photo keep Tk
@@ -153,7 +159,16 @@ class ConverterApp:
             "Flat.TButton", background=PANEL, foreground=TEXT,
             font=("Segoe UI", 10), padding=6, borderwidth=0,
         )
-        style.map("Flat.TButton", background=[("active", "#33364433")])
+        style.map("Flat.TButton", background=[("active", "#333644")])
+        style.configure(
+            "Tool.TButton", background="#343748", foreground=TEXT,
+            font=("Segoe UI", 10), padding=6, borderwidth=0,
+        )
+        style.map(
+            "Tool.TButton",
+            background=[("active", "#444864"), ("disabled", "#2c2e3b")],
+            foreground=[("disabled", "#6b7088")],
+        )
         style.configure("TProgressbar", background=ACCENT, troughcolor=PANEL, borderwidth=0)
         style.configure(
             "Treeview", background="#12131a", fieldbackground="#12131a",
@@ -216,7 +231,7 @@ class ConverterApp:
         wrap.grid_rowconfigure(0, weight=1)
         wrap.grid_columnconfigure(0, weight=1)
 
-        columns = ("name", "type", "status")
+        columns = ("name", "type", "rotation", "status")
         # show="tree headings" keeps the normally-hidden "#0" column visible -
         # that's the only column a ttk.Treeview can put a per-row image in,
         # which is what makes the thumbnails next to each filename possible.
@@ -225,10 +240,12 @@ class ConverterApp:
         self.tree.column("#0", width=46, minwidth=46, stretch=False, anchor="center")
         self.tree.heading("name", text="File")
         self.tree.heading("type", text="Type")
+        self.tree.heading("rotation", text="Rotated")
         self.tree.heading("status", text="Status")
-        self.tree.column("name", width=300, anchor="w")
-        self.tree.column("type", width=70, anchor="center")
-        self.tree.column("status", width=140, anchor="w")
+        self.tree.column("name", width=220, anchor="w")
+        self.tree.column("type", width=60, anchor="center")
+        self.tree.column("rotation", width=70, anchor="center")
+        self.tree.column("status", width=100, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
@@ -275,6 +292,22 @@ class ConverterApp:
             font=("Segoe UI", 9), justify="center",
         )
         self.preview_image_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Rotate controls: act on every selected image. Turning is clockwise
+        # and lossless; the result is what gets written when you convert.
+        rot_row = ttk.Frame(parent, style="Panel.TFrame")
+        rot_row.grid(row=r, column=0, sticky="w", padx=16, pady=(8, 0)); r += 1
+        self.rotate_buttons = [
+            ttk.Button(rot_row, text="↺ Left", style="Tool.TButton", width=8,
+                       command=lambda: self._rotate_selected(270)),
+            ttk.Button(rot_row, text="↻ Right", style="Tool.TButton", width=8,
+                       command=lambda: self._rotate_selected(90)),
+            ttk.Button(rot_row, text="180°", style="Tool.TButton", width=6,
+                       command=lambda: self._rotate_selected(180)),
+        ]
+        for btn in self.rotate_buttons:
+            btn.pack(side="left", padx=(0, 6))
+            btn.configure(state="disabled")
 
         self.preview_caption = ttk.Label(parent, text="", style="Sub.TLabel", wraplength=260, justify="left")
         self.preview_caption.grid(row=r, column=0, sticky="w", padx=16, pady=(6, 0)); r += 1
@@ -486,7 +519,7 @@ class ConverterApp:
             kind = ce.classify(p)
             if kind == "unknown":
                 continue
-            row_id = self.tree.insert("", "end", text="", values=(os.path.basename(p), kind, "Queued"))
+            row_id = self.tree.insert("", "end", text="", values=(os.path.basename(p), kind, "", "Queued"))
             self.jobs[p] = Job(src=p, kind=kind, row_id=row_id)
             self._queue_thumbnail(row_id, p, kind)
             added += 1
@@ -550,6 +583,10 @@ class ConverterApp:
         self.preview_photo = None
 
     def _update_preview_panel(self):
+        self._render_preview_panel()
+        self._update_rotate_buttons()
+
+    def _render_preview_panel(self):
         sel = self.tree.selection()
         if len(sel) == 0:
             self._set_preview_placeholder("Select a file\nto preview")
@@ -561,9 +598,10 @@ class ConverterApp:
             return
 
         row_id = sel[0]
-        src = next((s for s, j in self.jobs.items() if j.row_id == row_id), None)
-        if not src:
+        job = self._job_for_row(row_id)
+        if job is None:
             return
+        src = job.src
 
         info = self.preview_info.get(row_id)
         if info is None:
@@ -573,14 +611,16 @@ class ConverterApp:
         if info.image is None:
             self._set_preview_placeholder("No preview\navailable")
         else:
-            boxed = _compose_boxed(info.image, *PREVIEW_BOX)
+            boxed = _compose_boxed(ce.rotate_image(info.image, job.rotation), *PREVIEW_BOX)
             photo = ImageTk.PhotoImage(boxed)
             self.preview_photo = photo  # keep a reference alive - Tk drops GC'd images
             self.preview_image_label.configure(image=photo, text="")
 
         meta_bits = []
         if info.width and info.height:
-            meta_bits.append(f"{info.width} × {info.height}")
+            # a quarter turn swaps width and height
+            w, h = (info.height, info.width) if job.rotation in (90, 270) else (info.width, info.height)
+            meta_bits.append(f"{w} × {h}")
         if info.duration:
             m_, s_ = divmod(int(info.duration), 60)
             meta_bits.append(f"{m_}:{s_:02d}")
@@ -597,14 +637,83 @@ class ConverterApp:
         Tk PhotoImage must happen here, never on the background thread that
         generated the underlying PIL image."""
         self.preview_info[row_id] = info
-        if info.image is not None and self.tree.exists(row_id):
-            icon = info.image.copy()
-            icon.thumbnail((ROW_ICON_SIZE, ROW_ICON_SIZE), Image.LANCZOS)
-            photo = ImageTk.PhotoImage(icon)
-            self.row_photo[row_id] = photo  # keep alive, same reason as preview_photo
-            self.tree.item(row_id, image=photo)
+        self._refresh_row_icon(row_id)
         if row_id in self.tree.selection():
             self._update_preview_panel()
+
+    def _job_for_row(self, row_id: str) -> "Job | None":
+        return next((j for j in self.jobs.values() if j.row_id == row_id), None)
+
+    def _refresh_row_icon(self, row_id: str):
+        """(Re)draw the small list thumbnail, turned to match the file's
+        current rotation. Main thread only (creates a Tk PhotoImage)."""
+        info = self.preview_info.get(row_id)
+        if info is None or info.image is None or not self.tree.exists(row_id):
+            return
+        job = self._job_for_row(row_id)
+        icon = ce.rotate_image(info.image, job.rotation if job else 0).copy()
+        icon.thumbnail((ROW_ICON_SIZE, ROW_ICON_SIZE), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(icon)
+        self.row_photo[row_id] = photo  # keep alive, same reason as preview_photo
+        self.tree.item(row_id, image=photo)
+
+    # -------------------------------------------------------------- rotation
+    def _rotate_selected(self, delta: int):
+        """Turn every selected image `delta` degrees clockwise. Videos in the
+        selection are left alone."""
+        if self.converting:
+            return
+        changed = False
+        for row_id in self.tree.selection():
+            job = self._job_for_row(row_id)
+            if job is None or job.kind != "image":
+                continue
+            job.rotation = (job.rotation + delta) % 360
+            self.tree.set(row_id, "rotation", ROTATION_LABELS[job.rotation])
+            self._refresh_row_icon(row_id)
+            changed = True
+        if changed:
+            self._render_preview_panel()
+
+    def _update_rotate_buttons(self):
+        """Enabled only when at least one selected file is an image, and
+        locked while a batch is converting (the worker reads each file's
+        rotation, so it must not change underneath it)."""
+        has_image = False
+        for row_id in self.tree.selection():
+            job = self._job_for_row(row_id)
+            if job is not None and job.kind == "image":
+                has_image = True
+                break
+        state = "normal" if (has_image and not self.converting) else "disabled"
+        for btn in self.rotate_buttons:
+            btn.configure(state=state)
+
+    def _on_overwritten(self, row_id: str, old_src: str, new_src: str):
+        """After an overwrite, the queue entry must describe the NEW file:
+        its rotation is now baked into the pixels (so it must not be applied
+        a second time if Convert All is pressed again), the path/type may have
+        changed, and the old thumbnail is stale."""
+        job = self._job_for_row(row_id)
+        if job is None or not self.tree.exists(row_id):
+            return
+        self.jobs.pop(old_src, None)
+        new_kind = ce.classify(new_src)
+        if new_kind == "unknown":  # e.g. a video that became an .mp3 - not something this app can queue
+            self.tree.delete(row_id)
+            self._forget_preview(row_id)
+            self._refresh_target_options()
+            self._update_queue_count()
+            self._update_preview_panel()
+            return
+        job.src, job.kind, job.rotation = new_src, new_kind, 0
+        self.jobs[new_src] = job
+        self.tree.set(row_id, "name", os.path.basename(new_src))
+        self.tree.set(row_id, "type", new_kind)
+        self.tree.set(row_id, "rotation", "")
+        self.preview_info.pop(row_id, None)
+        self._queue_thumbnail(row_id, new_src, new_kind)
+        self._update_preview_panel()
 
     # ---------------------------------------------------------- conversion
     def _start_conversion(self):
@@ -629,6 +738,8 @@ class ConverterApp:
                 return
 
         self.cancel_event.clear()
+        self.converting = True
+        self._update_rotate_buttons()
         self.convert_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.open_folder_btn.configure(state="disabled")
@@ -683,7 +794,8 @@ class ConverterApp:
                 out_dir = self._resolve_out_dir(image_jobs[0].src, out_mode, custom_dir)
                 out_path = ce.unique_path(out_dir / "combined.pdf")
                 try:
-                    ce.images_to_pdf([j.src for j in image_jobs], str(out_path), lossless=lossless, quality=quality)
+                    ce.images_to_pdf([j.src for j in image_jobs], str(out_path), lossless=lossless, quality=quality,
+                                     rotations=[j.rotation for j in image_jobs])
                     for j in image_jobs:
                         self.msg_queue.put(("job_status", j.row_id, "Done"))
                     self.msg_queue.put(("log", f"Combined {len(image_jobs)} image(s) -> {out_path.name}"))
@@ -729,13 +841,15 @@ class ConverterApp:
                 if target_up == "PDF":
                     if job.kind != "image":
                         raise RuntimeError("only images can be converted to PDF")
-                    ce.images_to_pdf([job.src], str(temp_path), lossless=lossless, quality=quality)
+                    ce.images_to_pdf([job.src], str(temp_path), lossless=lossless, quality=quality,
+                                     rotations=[job.rotation])
 
                 elif job.kind == "image" and target_up != "PDF":
                     if target_up in ce.VIDEO_TARGETS and target_up not in ce.IMAGE_TARGETS:
                         raise RuntimeError(f"can't convert an image to {target_up}")
                     ce.convert_image(job.src, str(temp_path), target_up, quality=quality,
-                                      lossless=lossless, log=lambda m: self.msg_queue.put(("log", m)))
+                                      lossless=lossless, log=lambda m: self.msg_queue.put(("log", m)),
+                                      rotation=job.rotation)
 
                 elif job.kind == "video":
                     if target_up in ce.IMAGE_TARGETS and target_up not in ce.VIDEO_TARGETS:
@@ -753,6 +867,8 @@ class ConverterApp:
 
                 if overwrite:
                     final_path = Path(ce.finalize_overwrite(str(temp_path), job.src, ext))
+                    # the queue entry now has to describe the new file (see _on_overwritten)
+                    self.msg_queue.put(("overwritten", job.row_id, job.src, str(final_path)))
                 else:
                     final_path = temp_path
 
@@ -791,7 +907,8 @@ class ConverterApp:
                 kind = msg[0]
                 if kind == "job_status":
                     _, row_id, status = msg
-                    self.tree.set(row_id, "status", status)
+                    if self.tree.exists(row_id):  # the row may have been removed mid-run
+                        self.tree.set(row_id, "status", status)
                 elif kind == "progress":
                     self.progress.configure(value=msg[1])
                 elif kind == "log":
@@ -802,11 +919,15 @@ class ConverterApp:
                     self._on_finished(msg[1])
                 elif kind == "thumb_ready":
                     self._apply_thumbnail(msg[1], msg[2])
+                elif kind == "overwritten":
+                    self._on_overwritten(msg[1], msg[2], msg[3])
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
 
     def _on_finished(self, out_dir: str | None):
+        self.converting = False
+        self._update_rotate_buttons()
         self.convert_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
         self.status_label.configure(text="Done" if not self.cancel_event.is_set() else "Cancelled")

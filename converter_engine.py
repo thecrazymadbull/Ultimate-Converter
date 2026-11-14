@@ -1,3 +1,4 @@
+"""
 Ultimate Converter - conversion engine.
 
 All the actual file-conversion logic lives here, completely independent of
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from PIL import Image, ImageSequence
+from PIL import Image, ImageOps, ImageSequence
 
 # --------------------------------------------------------------------------
 # Optional format plugins. The app still works without them - it just won't
@@ -172,6 +173,26 @@ def _flatten_alpha(im: Image.Image, bg=(255, 255, 255)) -> Image.Image:
     return im.convert("RGB")
 
 
+# Pillow's Transpose.ROTATE_* constants turn an image COUNTER-clockwise, but
+# people think in clockwise terms ("rotate right"), so this maps a clockwise
+# angle onto the matching counter-clockwise constant.
+_CW_TO_TRANSPOSE = {
+    90: Image.Transpose.ROTATE_270,
+    180: Image.Transpose.ROTATE_180,
+    270: Image.Transpose.ROTATE_90,
+}
+
+
+def rotate_image(im: Image.Image, degrees_cw: int) -> Image.Image:
+    """Rotate clockwise by a multiple of 90 degrees. This is a pure pixel
+    shuffle (no resampling), so it costs no quality. Returns `im` itself,
+    untouched, when no rotation is needed."""
+    degrees_cw %= 360
+    if degrees_cw == 0:
+        return im
+    return im.transpose(_CW_TO_TRANSPOSE[degrees_cw])
+
+
 def convert_image(
     src: str,
     dst: str,
@@ -179,9 +200,11 @@ def convert_image(
     quality: int = 85,
     lossless: bool = False,
     log: Optional[Callable[[str], None]] = None,
+    rotation: int = 0,
 ) -> None:
     """Convert a single image file to another image format (not PDF -
-    use images_to_pdf for that)."""
+    use images_to_pdf for that). `rotation` is extra clockwise degrees
+    (0/90/180/270) applied on top of the image's own orientation."""
     target = target.upper()
     log = log or (lambda msg: None)
 
@@ -189,7 +212,7 @@ def convert_image(
         is_animated = getattr(im, "is_animated", False) and getattr(im, "n_frames", 1) > 1
 
         if target in ANIMATABLE_IMAGE_TARGETS and is_animated:
-            frames = [f.convert("RGBA") for f in ImageSequence.Iterator(im)]
+            frames = [rotate_image(f.convert("RGBA"), rotation) for f in ImageSequence.Iterator(im)]
             durations = im.info.get("duration", 100)
             first, rest = frames[0], frames[1:]
             save_kwargs = {
@@ -201,7 +224,12 @@ def convert_image(
         else:
             if is_animated:
                 log("Source has multiple frames; only the first frame is kept for this format.")
-            first = im.copy()
+            # Phones and cameras often store photos "sideways" plus an EXIF
+            # tag saying how to turn them. Our output doesn't carry that tag,
+            # so bake the turn into the pixels first (exif_transpose also
+            # strips the tag, so nothing gets rotated twice), then apply
+            # whatever extra rotation the user asked for.
+            first = rotate_image(ImageOps.exif_transpose(im), rotation)
             save_kwargs = {}
 
         if target == "JPEG":
@@ -247,13 +275,17 @@ def convert_image(
         first.save(dst, format=target, **save_kwargs)
 
 
-def _image_payload(path: str, lossless: bool, quality: int) -> bytes | str:
+def _image_payload(path: str, lossless: bool, quality: int, rotation: int = 0) -> bytes | str:
     """Return something img2pdf.convert() can embed for one source image."""
     ext = Path(path).suffix.lower()
-    if lossless and ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
+    if lossless and rotation % 360 == 0 and ext in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
         # img2pdf can wrap these formats byte-for-byte with zero recompression
+        # (it also honors the file's own EXIF orientation). A user rotation
+        # can't be applied to the raw bytes, so those images fall through
+        # to the re-encode path below.
         return path
-    with Image.open(path) as im:
+    with Image.open(path) as opened:
+        im = rotate_image(ImageOps.exif_transpose(opened), rotation)
         buf = io.BytesIO()
         if lossless:
             im.convert("RGBA" if "A" in im.mode else "RGB").save(buf, format="PNG", optimize=True)
@@ -267,9 +299,14 @@ def images_to_pdf(
     dst: str,
     lossless: bool = True,
     quality: int = 85,
+    rotations: Optional[list[int]] = None,
 ) -> None:
-    """Combine one or more images into a single PDF file."""
-    payloads = [_image_payload(p, lossless, quality) for p in paths]
+    """Combine one or more images into a single PDF file. `rotations`, if
+    given, holds one clockwise angle (0/90/180/270) per image."""
+    payloads = [
+        _image_payload(p, lossless, quality, rotations[i] if rotations else 0)
+        for i, p in enumerate(paths)
+    ]
     with open(dst, "wb") as f:
         f.write(img2pdf.convert(payloads))
 
@@ -452,7 +489,9 @@ def generate_preview(
     so the GUI can show "no preview available" instead of crashing."""
     try:
         if kind == "image":
-            with Image.open(src) as im:
+            with Image.open(src) as opened:
+                # Show it the way a normal photo viewer would (EXIF turn applied)
+                im = ImageOps.exif_transpose(opened)
                 w, h = im.size
                 thumb = im.convert("RGBA" if "A" in im.mode else "RGB")
                 thumb.thumbnail((max_size, max_size), Image.LANCZOS)
