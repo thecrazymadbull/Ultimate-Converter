@@ -637,19 +637,51 @@ class ConverterApp:
             self.tree.move(rid, "", idx)
 
     @staticmethod
-    def _drag_order(order: list, block: set, target) -> list:
-        """New row order after dragging `block` onto `target`: the block lands
-        just before the target when dragged up, just after it when dragged down."""
+    def _drop_order(order: list, block: set, target, after: bool) -> list:
+        """New row order after dropping `block` just before (or, if `after`,
+        just after) the row `target`. Dropping onto the block itself changes nothing."""
         if target not in order or target in block:
             return order
         block_l = [r for r in order if r in block]
         if not block_l:
             return order
         rest = [r for r in order if r not in block]
-        idx = rest.index(target)
-        if order.index(target) > order.index(block_l[0]):
-            idx += 1
+        idx = rest.index(target) + (1 if after else 0)
         return rest[:idx] + block_l + rest[idx:]
+
+    def _drop_point(self, y: int):
+        """Where a drop at height y would land: (row, after, line_y), where
+        line_y is the pixel height of the insertion bar. None if no rows."""
+        rows = list(self.tree.get_children())
+        if not rows:
+            return None
+        row = self.tree.identify_row(y)
+        if not row:
+            row = rows[0] if y < 0 else rows[-1]
+            bx = self.tree.bbox(row)
+            if not bx:
+                return None
+            after = y >= 0
+        else:
+            bx = self.tree.bbox(row)
+            if not bx:
+                return None
+            after = y >= bx[1] + bx[3] / 2  # lower half of a row = drop after it
+        return row, after, (bx[1] + bx[3] if after else bx[1])
+
+    def _show_drop_line(self, line_y):
+        if line_y is None:
+            self._hide_drop_line()
+            return
+        if getattr(self, "drop_line", None) is None:
+            self.drop_line = tk.Frame(self.tree, bg=ACCENT, height=3)
+        self.drop_line.place(x=0, y=max(0, int(line_y) - 1), relwidth=1.0, height=3)
+        self.drop_line.lift()
+
+    def _hide_drop_line(self):
+        line = getattr(self, "drop_line", None)
+        if line is not None:
+            line.place_forget()
 
     def _drag_press(self, event):
         self._drag = None
@@ -660,13 +692,17 @@ class ConverterApp:
         row = self.tree.identify_row(event.y)
         if not row:
             return None
-        self._drag = {"row": row, "y0": event.y, "moved": False, "keep": False}
+        self._drag = {"row": row, "y0": event.y, "moved": False, "keep": False, "drop": None}
         modifier = event.state & 0x0005  # Shift or Ctrl held: normal multi-select
         if not modifier and len(self.tree.selection()) > 1 and row in self.tree.selection():
             # keep the whole selection so the block can be dragged together
             self._drag["keep"] = True
             return "break"
         return None
+
+    def _drag_block(self) -> set:
+        sel = set(self.tree.selection())
+        return sel if self._drag["row"] in sel else {self._drag["row"]}
 
     def _drag_motion(self, event):
         d = self._drag
@@ -675,27 +711,45 @@ class ConverterApp:
         if not d["moved"] and abs(event.y - d["y0"]) < 6:
             return None
         d["moved"] = True
-        rows = list(self.tree.get_children())
-        if not rows:
-            return None
-        target = self.tree.identify_row(event.y)
-        if not target:
-            target = rows[0] if event.y < 0 else rows[-1]
-        sel = set(self.tree.selection())
-        block = sel if d["row"] in sel else {d["row"]}
-        new = self._drag_order(rows, block, target)
-        if new != rows:
-            for idx, rid in enumerate(new):
-                self.tree.move(rid, "", idx)
+        # nudge the list while dragging near its top/bottom edge
         try:
-            self.tree.see(target)
+            if event.y < 10:
+                self.tree.yview_scroll(-1, "units")
+            elif event.y > self.tree.winfo_height() - 10:
+                self.tree.yview_scroll(1, "units")
         except Exception:
             pass
+        point = self._drop_point(event.y)
+        if point is None:
+            d["drop"] = None
+            self._hide_drop_line()
+            return "break"
+        row, after, line_y = point
+        order = list(self.tree.get_children())
+        if self._drop_order(order, self._drag_block(), row, after) == order:
+            d["drop"] = None  # dropping here would change nothing
+            self._hide_drop_line()
+        else:
+            d["drop"] = (row, after)
+            self._show_drop_line(line_y)
         return "break"
 
     def _drag_release(self, event):
         d, self._drag = self._drag, None
-        if d and d["keep"] and not d["moved"]:
+        self._hide_drop_line()
+        if not d:
+            return None
+        if d["moved"] and d["drop"]:
+            row, after = d["drop"]
+            self._drag = d  # _drag_block reads it
+            block = self._drag_block()
+            self._drag = None
+            order = list(self.tree.get_children())
+            new = self._drop_order(order, block, row, after)
+            if new != order:
+                for idx, rid in enumerate(new):
+                    self.tree.move(rid, "", idx)
+        elif d["keep"] and not d["moved"]:
             self.tree.selection_set(d["row"])  # plain click on a multi-selection: select just that row
         return None
 
