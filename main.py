@@ -252,6 +252,11 @@ class ConverterApp:
         self.tree.column("status", width=100, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        # drag a row (or the selected block) up/down to reorder
+        self._drag = None
+        self.tree.bind("<ButtonPress-1>", self._drag_press, add="+")
+        self.tree.bind("<B1-Motion>", self._drag_motion, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._drag_release, add="+")
 
         scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -364,7 +369,7 @@ class ConverterApp:
         )
         self.combine_pdf_check.grid(row=0, column=0, sticky="w")
         self.pdf_hint = ttk.Label(
-            self.pdf_frame, text="Pages follow the list order - use ▲ Up / ▼ Down to rearrange.",
+            self.pdf_frame, text="Pages follow the list order - drag files in the list (or use ▲ Up / ▼ Down) to rearrange.",
             style="Sub.TLabel", wraplength=260, justify="left",
         )
         self.pdf_hint.grid(row=1, column=0, sticky="w", pady=(2, 0))
@@ -630,6 +635,69 @@ class ConverterApp:
             return
         for idx, rid in enumerate(order):
             self.tree.move(rid, "", idx)
+
+    @staticmethod
+    def _drag_order(order: list, block: set, target) -> list:
+        """New row order after dragging `block` onto `target`: the block lands
+        just before the target when dragged up, just after it when dragged down."""
+        if target not in order or target in block:
+            return order
+        block_l = [r for r in order if r in block]
+        if not block_l:
+            return order
+        rest = [r for r in order if r not in block]
+        idx = rest.index(target)
+        if order.index(target) > order.index(block_l[0]):
+            idx += 1
+        return rest[:idx] + block_l + rest[idx:]
+
+    def _drag_press(self, event):
+        self._drag = None
+        if self.converting:
+            return None
+        if self.tree.identify_region(event.x, event.y) not in ("tree", "cell"):
+            return None
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return None
+        self._drag = {"row": row, "y0": event.y, "moved": False, "keep": False}
+        modifier = event.state & 0x0005  # Shift or Ctrl held: normal multi-select
+        if not modifier and len(self.tree.selection()) > 1 and row in self.tree.selection():
+            # keep the whole selection so the block can be dragged together
+            self._drag["keep"] = True
+            return "break"
+        return None
+
+    def _drag_motion(self, event):
+        d = self._drag
+        if not d:
+            return None
+        if not d["moved"] and abs(event.y - d["y0"]) < 6:
+            return None
+        d["moved"] = True
+        rows = list(self.tree.get_children())
+        if not rows:
+            return None
+        target = self.tree.identify_row(event.y)
+        if not target:
+            target = rows[0] if event.y < 0 else rows[-1]
+        sel = set(self.tree.selection())
+        block = sel if d["row"] in sel else {d["row"]}
+        new = self._drag_order(rows, block, target)
+        if new != rows:
+            for idx, rid in enumerate(new):
+                self.tree.move(rid, "", idx)
+        try:
+            self.tree.see(target)
+        except Exception:
+            pass
+        return "break"
+
+    def _drag_release(self, event):
+        d, self._drag = self._drag, None
+        if d and d["keep"] and not d["moved"]:
+            self.tree.selection_set(d["row"])  # plain click on a multi-selection: select just that row
+        return None
 
     def _update_queue_count(self):
         n = len(self.jobs)
