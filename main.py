@@ -270,10 +270,12 @@ class ConverterApp:
         row2.grid(row=2, column=0, sticky="ew")
         ttk.Button(row2, text="Remove selected", style="Flat.TButton", command=self.remove_selected).pack(side="left")
         ttk.Button(row2, text="Clear all", style="Flat.TButton", command=self.clear_all).pack(side="left", padx=6)
-        # Order matters for a combined PDF: pages follow the list from top to bottom.
-        ttk.Button(row2, text="▲ Up", style="Flat.TButton", width=6,
+        # Order only matters for a PDF (pages follow the list), so these
+        # buttons are shown only while PDF is the chosen format.
+        self.move_frame = ttk.Frame(row2, style="TFrame")
+        ttk.Button(self.move_frame, text="▲ Up", style="Flat.TButton", width=6,
                    command=lambda: self._move_selected(-1)).pack(side="left", padx=(6, 0))
-        ttk.Button(row2, text="▼ Down", style="Flat.TButton", width=7,
+        ttk.Button(self.move_frame, text="▼ Down", style="Flat.TButton", width=7,
                    command=lambda: self._move_selected(1)).pack(side="left", padx=(2, 0))
         self.queue_count_label = ttk.Label(row2, text="0 files queued", style="TLabel")
         self.queue_count_label.pack(side="right")
@@ -487,8 +489,10 @@ class ConverterApp:
 
         if target == "PDF":
             self.pdf_frame.grid(row=self._combine_pdf_row, column=0, sticky="ew", padx=16, pady=(10, 4))
+            self.move_frame.pack(side="left")
         else:
             self.pdf_frame.grid_remove()
+            self.move_frame.pack_forget()
 
         self._update_overwrite_lock()
 
