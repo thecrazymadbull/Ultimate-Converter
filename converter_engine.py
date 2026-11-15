@@ -47,6 +47,15 @@ except ImportError:
 
 import img2pdf
 
+# Reading PDFs (PDF -> images) uses pypdfium2, which bundles its own renderer,
+# so nothing extra has to be installed on the user's machine.
+try:
+    import pypdfium2 as _pdfium
+    HAS_PDF_READ = True
+except Exception:  # ImportError, or the native library failed to load
+    _pdfium = None
+    HAS_PDF_READ = False
+
 # --------------------------------------------------------------------------
 # Supported formats
 # --------------------------------------------------------------------------
@@ -56,6 +65,7 @@ if HAS_AVIF:
 if HAS_HEIF:
     IMAGE_EXTS.update({".heic", ".heif"})
 
+PDF_EXTS = {".pdf"}
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv", ".wmv", ".mpg", ".mpeg", ".ts"}
 
 IMAGE_TARGETS = ["PNG", "JPEG", "WEBP", "BMP", "TIFF", "GIF", "ICO", "PDF"]
@@ -77,10 +87,18 @@ TARGET_KIND["PDF"] = "pdf"
 
 ALL_TARGETS = list(dict.fromkeys(IMAGE_TARGETS + VIDEO_TARGETS))
 
+# A PDF *input* is turned into pictures, one per page (never back into a PDF).
+PDF_TARGETS = [t for t in IMAGE_TARGETS if t != "PDF"]
+PDF_DPI_CHOICES = {"Standard (150 DPI)": 150, "High (200 DPI)": 200, "Maximum (300 DPI)": 300}
+PDF_DPI_DEFAULT = "High (200 DPI)"
+PDF_MAX_SIDE_PX = 12000  # safety cap so a poster-sized page can't eat all memory
+
 
 def classify(path: str) -> str:
-    """Return 'image', 'video' or 'unknown' based on file extension."""
+    """Return 'image', 'video', 'pdf' or 'unknown' based on file extension."""
     ext = Path(path).suffix.lower()
+    if ext in PDF_EXTS:
+        return "pdf"
     if ext in IMAGE_EXTS:
         return "image"
     if ext in VIDEO_EXTS:
@@ -93,6 +111,8 @@ def valid_targets_for(kind: str) -> list[str]:
         return IMAGE_TARGETS
     if kind == "video":
         return VIDEO_TARGETS
+    if kind == "pdf":
+        return PDF_TARGETS
     return ALL_TARGETS
 
 
@@ -420,6 +440,94 @@ _TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
+# --------------------------------------------------------------------------
+# PDF input (PDF -> one image per page)
+# --------------------------------------------------------------------------
+def _open_pdf(path: str):
+    if not HAS_PDF_READ:
+        raise RuntimeError("reading PDFs isn't available in this build (the pypdfium2 library is missing)")
+    try:
+        return _pdfium.PdfDocument(path)
+    except Exception as exc:  # noqa: BLE001
+        if "password" in str(exc).lower():
+            raise RuntimeError("this PDF is password-protected") from exc
+        raise RuntimeError("couldn't open this PDF (it may be damaged)") from exc
+
+
+def _render_pdf_page(doc, index: int, scale: float, max_side: int = PDF_MAX_SIDE_PX) -> Image.Image:
+    page = doc[index]
+    try:
+        w, h = page.get_size()
+        scale = min(scale, max_side / max(w, h, 1.0))
+        return page.render(scale=scale).to_pil().convert("RGB")  # white paper background
+    finally:
+        page.close()
+
+
+def pdf_to_images(
+    src: str,
+    out_dir: Path,
+    target: str,
+    ext: str,
+    quality: int = 85,
+    lossless: bool = False,
+    dpi: int = 200,
+    log: Optional[Callable[[str], None]] = None,
+    progress_cb: Optional[Callable[[float], None]] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
+) -> list[str]:
+    """Save every page of a PDF as an image. A one-page PDF gives `name.ext`;
+    a longer one gets its own folder `name/` holding name_page01.ext, ...
+    Nothing already on disk is overwritten. If anything fails or is
+    cancelled part-way, the pages already written are removed again."""
+    log = log or (lambda msg: None)
+    out_dir = Path(out_dir)
+    doc = _open_pdf(src)
+    created: list[Path] = []
+    made_dir: Optional[Path] = None
+    try:
+        n = len(doc)
+        if n == 0:
+            raise RuntimeError("this PDF has no pages")
+        stem = Path(src).stem
+        if n == 1:
+            dests = [unique_path(out_dir / f"{stem}.{ext}")]
+        else:
+            made_dir = unique_path(out_dir / stem)
+            made_dir.mkdir(parents=True)
+            width = max(2, len(str(n)))
+            dests = [made_dir / f"{stem}_page{i + 1:0{width}d}.{ext}" for i in range(n)]
+        with tempfile.TemporaryDirectory() as td:
+            for i, dest in enumerate(dests):
+                if is_cancelled and is_cancelled():
+                    raise ConversionCancelled()
+                img = _render_pdf_page(doc, i, dpi / 72.0)
+                tmp = os.path.join(td, "page.png")
+                img.save(tmp)
+                convert_image(tmp, str(dest), target, quality=quality, lossless=lossless, log=log)
+                created.append(dest)
+                if progress_cb:
+                    progress_cb((i + 1) / n)
+        return [str(p) for p in created]
+    except BaseException:
+        for p in created:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        if made_dir is not None:
+            try:
+                made_dir.rmdir()
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            doc.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _hms(h, m, s) -> float:
     return int(h) * 3600 + int(m) * 60 + float(s)
 
@@ -576,6 +684,7 @@ class PreviewInfo:
     width: Optional[int] = None          # the SOURCE file's real dimensions,
     height: Optional[int] = None         # not the (possibly smaller) thumbnail's
     duration: Optional[float] = None     # seconds; video only
+    pages: Optional[int] = None          # page count; PDF only
 
 
 def generate_preview(
@@ -596,6 +705,20 @@ def generate_preview(
                 thumb = im.convert("RGBA" if "A" in im.mode else "RGB")
                 thumb.thumbnail((max_size, max_size), Image.LANCZOS)
                 return PreviewInfo(image=thumb.copy(), width=w, height=h)
+
+        elif kind == "pdf":
+            doc = _open_pdf(src)
+            try:
+                n = len(doc)
+                page = doc[0]
+                try:
+                    pw, ph = page.get_size()
+                finally:
+                    page.close()
+                thumb = _render_pdf_page(doc, 0, max_size / max(pw, ph, 1.0), max_side=max_size)
+                return PreviewInfo(image=thumb, pages=n)
+            finally:
+                doc.close()
 
         elif kind == "video" and ffmpeg_path:
             with tempfile.TemporaryDirectory() as td:

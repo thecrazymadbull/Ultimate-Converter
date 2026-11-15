@@ -27,7 +27,7 @@ except ImportError:
     HAS_DND = False
 
 APP_TITLE = "Ultimate Converter"
-APP_VERSION = "1.2"  # shown in the window title and header - bump this on each release
+APP_VERSION = "1.2.1"  # shown in the window title and header - bump this on each release
 BG = "#1e1f26"
 PANEL = "#262833"
 ACCENT = "#5b8cff"
@@ -388,6 +388,22 @@ class ConverterApp:
         self.page_size_combo.grid(row=5, column=0, sticky="ew", pady=(2, 0))
         combine_row = r; r += 1
 
+        # Shown only when a PDF is in the list and the target is a picture format
+        self.pdf_in_frame = ttk.Frame(parent, style="Panel.TFrame")
+        self.pdf_in_frame.grid_columnconfigure(0, weight=1)
+        ttk.Label(self.pdf_in_frame, text="PDF page resolution", style="Panel.TLabel").grid(row=0, column=0, sticky="w")
+        self.dpi_var = tk.StringVar(value=ce.PDF_DPI_DEFAULT)
+        self.dpi_combo = ttk.Combobox(
+            self.pdf_in_frame, textvariable=self.dpi_var, state="readonly",
+            values=list(ce.PDF_DPI_CHOICES.keys()),
+        )
+        self.dpi_combo.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        ttk.Label(
+            self.pdf_in_frame, text="Each PDF page becomes one picture. Multi-page PDFs get their own folder.",
+            style="Sub.TLabel", wraplength=260, justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self._pdf_in_row = r; r += 1
+
         ttk.Separator(parent, orient="horizontal").grid(row=r, column=0, sticky="ew", padx=16, pady=16); r += 1
 
         # ---- Output location -----------------------------------------------
@@ -427,6 +443,8 @@ class ConverterApp:
         self._combine_pdf_row = combine_row
         self.pdf_frame.grid(row=combine_row, column=0, sticky="ew", padx=16, pady=(10, 4))
         self.pdf_frame.grid_remove()
+        self.pdf_in_frame.grid(row=self._pdf_in_row, column=0, sticky="ew", padx=16, pady=(10, 4))
+        self.pdf_in_frame.grid_remove()
 
     def _build_action_bar(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -463,6 +481,10 @@ class ConverterApp:
             options = ce.IMAGE_TARGETS
         elif kinds == {"video"}:
             options = ce.VIDEO_TARGETS
+        elif kinds == {"pdf"}:
+            options = ce.PDF_TARGETS
+        elif kinds == {"image", "pdf"}:
+            options = ce.IMAGE_TARGETS
         else:
             options = ce.ALL_TARGETS
         current = self.target_var.get()
@@ -494,6 +516,11 @@ class ConverterApp:
             self.pdf_frame.grid_remove()
             self.move_frame.pack_forget()
 
+        if "pdf" in self._current_kinds() and target != "PDF":
+            self.pdf_in_frame.grid(row=self._pdf_in_row, column=0, sticky="ew", padx=16, pady=(10, 4))
+        else:
+            self.pdf_in_frame.grid_remove()
+
         self._update_overwrite_lock()
 
     def _on_lossless_toggle(self):
@@ -510,10 +537,13 @@ class ConverterApp:
         merged into one combined PDF - there's no single original to
         replace - so that combo is disabled rather than silently ignored."""
         combining = self.target_var.get().upper() == "PDF" and self.combine_pdf_var.get()
-        self.overwrite_radio.configure(state="disabled" if combining else "normal")
+        # a PDF turns into several pictures, so there is no single file to swap in
+        has_pdf_input = "pdf" in self._current_kinds()
+        locked = combining or has_pdf_input
+        self.overwrite_radio.configure(state="disabled" if locked else "normal")
         # the name box only matters when everything is joined into one file
         self.pdf_name_entry.configure(state="normal" if combining else "disabled")
-        if combining and self.out_mode_var.get() == "overwrite":
+        if locked and self.out_mode_var.get() == "overwrite":
             self.out_mode_var.set("alongside")
             self._update_overwrite_warning()
 
@@ -827,6 +857,8 @@ class ConverterApp:
             # a quarter turn swaps width and height
             w, h = (info.height, info.width) if job.rotation in (90, 270) else (info.width, info.height)
             meta_bits.append(f"{w} × {h}")
+        if info.pages:
+            meta_bits.append(f"{info.pages} page{'s' if info.pages != 1 else ''}")
         if info.duration:
             m_, s_ = divmod(int(info.duration), 60)
             meta_bits.append(f"{m_}:{s_:02d}")
@@ -963,6 +995,7 @@ class ConverterApp:
         out_mode = self.out_mode_var.get()
         custom_dir = self.custom_out_dir
 
+        pdf_dpi = ce.PDF_DPI_CHOICES.get(self.dpi_var.get(), ce.PDF_DPI_CHOICES[ce.PDF_DPI_DEFAULT])
         pdf_name = ce.safe_filename(self.pdf_name_var.get())
         page_size = self.page_size_var.get()  # a key of ce.PDF_PAGE_SIZES
         self._save_settings()
@@ -970,7 +1003,7 @@ class ConverterApp:
         self.worker_thread = threading.Thread(
             target=self._worker,
             args=(self._ordered_jobs(), target, quality, lossless, combine_pdf, out_mode, custom_dir),
-            kwargs=dict(recycle=recycle, pdf_name=pdf_name, page_size=page_size),
+            kwargs=dict(recycle=recycle, pdf_name=pdf_name, page_size=page_size, pdf_dpi=pdf_dpi),
             daemon=True,
         )
         self.worker_thread.start()
@@ -989,7 +1022,8 @@ class ConverterApp:
 
     def _worker(self, jobs: list[Job], target: str, quality: int, lossless: bool,
                 combine_pdf: bool, out_mode: str, custom_dir: str | None,
-                recycle: bool = False, pdf_name: str = "combined", page_size=None):
+                recycle: bool = False, pdf_name: str = "combined", page_size=None,
+                pdf_dpi: int = 200):
         target_up = target.upper()
         ext = EXT_MAP.get(target_up, target_up.lower())
         total = len(jobs)
@@ -1051,6 +1085,30 @@ class ConverterApp:
             last_out_dir = str(work_dir)
 
             try:
+                if job.kind == "pdf":
+                    if target_up == "PDF":
+                        raise RuntimeError("it's already a PDF - pick a picture format to get its pages")
+                    if overwrite:
+                        raise RuntimeError("a PDF makes several pictures, so it can't overwrite the original - "
+                                           "choose another save location")
+
+                    def pdf_progress(frac, _done=done, _total=total):
+                        self.msg_queue.put(("progress", (_done + frac) / _total * 100))
+
+                    made = ce.pdf_to_images(
+                        job.src, work_dir, target_up, ext, quality=quality, lossless=lossless, dpi=pdf_dpi,
+                        log=lambda m: self.msg_queue.put(("log", m)),
+                        progress_cb=pdf_progress, is_cancelled=is_cancelled)
+                    where = Path(made[0]).parent
+                    self.msg_queue.put(("job_status", job.row_id, "Done"))
+                    if len(made) == 1:
+                        self.msg_queue.put(("log", f"{os.path.basename(job.src)} -> {Path(made[0]).name}"))
+                    else:
+                        self.msg_queue.put(("log", f"{os.path.basename(job.src)} -> {len(made)} pages in folder '{where.name}'"))
+                    done += 1
+                    self.msg_queue.put(("progress", done / total * 100))
+                    continue
+
                 if target_up == "PDF":
                     if job.kind != "image":
                         raise RuntimeError("only images can be converted to PDF")
@@ -1124,6 +1182,7 @@ class ConverterApp:
             "combine_pdf": bool(self.combine_pdf_var.get()),
             "pdf_name": self.pdf_name_var.get(),
             "page_size": self.page_size_var.get(),
+            "pdf_dpi": self.dpi_var.get(),
             "recycle": bool(self.recycle_var.get()),
             "out_mode": out_mode,
             "custom_dir": self.custom_out_dir,
@@ -1147,6 +1206,8 @@ class ConverterApp:
                 self.pdf_name_var.set(data["pdf_name"])
             if data.get("page_size") in ce.PDF_PAGE_SIZES:
                 self.page_size_var.set(data["page_size"])
+            if data.get("pdf_dpi") in ce.PDF_DPI_CHOICES:
+                self.dpi_var.set(data["pdf_dpi"])
             if isinstance(data.get("recycle"), bool):
                 self.recycle_var.set(data["recycle"])
             cd = data.get("custom_dir")
