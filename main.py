@@ -27,7 +27,7 @@ except ImportError:
     HAS_DND = False
 
 APP_TITLE = "Ultimate Converter"
-APP_VERSION = "1.2.1"  # shown in the window title and header - bump this on each release
+APP_VERSION = "1.2.2"  # shown in the window title and header - bump this on each release
 BG = "#1e1f26"
 PANEL = "#262833"
 ACCENT = "#5b8cff"
@@ -511,10 +511,9 @@ class ConverterApp:
 
         if target == "PDF":
             self.pdf_frame.grid(row=self._combine_pdf_row, column=0, sticky="ew", padx=16, pady=(10, 4))
-            self.move_frame.pack(side="left")
         else:
             self.pdf_frame.grid_remove()
-            self.move_frame.pack_forget()
+        self._update_move_buttons()
 
         if "pdf" in self._current_kinds() and target != "PDF":
             self.pdf_in_frame.grid(row=self._pdf_in_row, column=0, sticky="ew", padx=16, pady=(10, 4))
@@ -531,6 +530,19 @@ class ConverterApp:
 
     def _on_combine_toggle(self):
         self._update_overwrite_lock()
+        self._update_move_buttons()
+
+    def _update_move_buttons(self):
+        """▲ Up / ▼ Down (and the page-order hint) only matter when images are
+        being merged into ONE multi-page PDF - for anything else the order of
+        the list changes nothing - so they're shown only then."""
+        combining = self.target_var.get().upper() == "PDF" and bool(self.combine_pdf_var.get())
+        if combining:
+            self.move_frame.pack(side="left")
+            self.pdf_hint.grid()
+        else:
+            self.move_frame.pack_forget()
+            self.pdf_hint.grid_remove()
 
     def _update_overwrite_lock(self):
         """Overwriting doesn't make sense when several images are being
