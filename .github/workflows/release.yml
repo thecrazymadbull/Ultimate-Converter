@@ -36,7 +36,19 @@ jobs:
 
       - name: Build the APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Show what went wrong
+        if: failure()
+        run: |
+          log="$RUNNER_TEMP/build.log"
+          errs=$(grep -E '^e: ' "$log" | sed 's#file:///home/runner/work/[^/]*/[^/]*/##' | head -40 || true)
+          if [ -z "$errs" ]; then errs=$(grep -A8 'What went wrong' "$log" | head -30 || true); fi
+          { echo '### Android build errors'; echo; echo '```'; echo "$errs"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          msg=$(echo "$errs" | head -20 | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::error title=Android build errors::$msg"
 
       - name: Keep the APK
         uses: actions/upload-artifact@v4
