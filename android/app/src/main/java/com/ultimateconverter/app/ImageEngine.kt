@@ -2,10 +2,13 @@ package com.ultimateconverter.app
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.pdf.PdfDocument
 import android.os.Build
+import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import kotlinx.coroutines.currentCoroutineContext
@@ -39,8 +42,69 @@ object ImageEngine {
                     flat.getPixels(row, 0, flat.width, 0, y, flat.width, 1)
                 }
             }
+            Target.AVIF -> {
+                val argb = if (src.config == Bitmap.Config.ARGB_8888) src else (src.copy(Bitmap.Config.ARGB_8888, false) ?: throw IOException("Not enough memory for this picture"))
+                out.write(AvifEncoder.encode(argb))
+            }
+            Target.TIFF -> {
+                val buffered = BufferedOutputStream(out, 1 shl 16)
+                writeTiff(src.width, src.height, buffered) { y, row ->
+                    src.getPixels(row, 0, src.width, 0, y, src.width, 1)
+                }
+                buffered.flush()
+            }
+            Target.GIF -> {
+                val small = fitWithin(src, GIF_STILL_MAX_SIDE)
+                val w = small.width
+                val h = small.height
+                val pixels = IntArray(w * h)
+                small.getPixels(pixels, 0, w, 0, 0, w, h)
+                val buffered = BufferedOutputStream(out, 1 shl 16)
+                val gif = GifWriter(buffered, w, h, false)
+                gif.addFrame(pixels, 100, true)
+                gif.finish()
+                buffered.flush()
+            }
+            Target.ICO -> writeIcon(src, out)
             else -> throw IllegalArgumentException("${target.label} is not a picture format")
         }
+    }
+
+    private const val GIF_STILL_MAX_SIDE = 4096
+    private val ICON_SIZES = intArrayOf(16, 32, 48, 64, 128, 256)
+
+    /** Shrinks [src] so its longest side is at most [maxSide] (never enlarges). */
+    fun fitWithin(src: Bitmap, maxSide: Int): Bitmap {
+        val longest = maxOf(src.width, src.height)
+        if (longest <= maxSide) return src
+        val s = maxSide.toFloat() / longest
+        return smoothScale(src, maxOf(1, (src.width * s).roundToInt()), maxOf(1, (src.height * s).roundToInt()))
+    }
+
+    /** Resizes in halving steps so big photos shrink without ugly jagged edges. */
+    fun smoothScale(src: Bitmap, w: Int, h: Int): Bitmap {
+        var cur = src
+        while (cur.width > w * 2 || cur.height > h * 2) {
+            cur = Bitmap.createScaledBitmap(cur, maxOf(w, cur.width / 2), maxOf(h, cur.height / 2), true)
+        }
+        return if (cur.width == w && cur.height == h) cur else Bitmap.createScaledBitmap(cur, w, h, true)
+    }
+
+    /** Windows icon with 16 to 256 px versions of the picture (kept in proportion on a see-through square). */
+    private fun writeIcon(src: Bitmap, out: OutputStream) {
+        val pngs = ArrayList<Pair<Int, ByteArray>>()
+        for (size in ICON_SIZES) {
+            val scale = minOf(size.toFloat() / src.width, size.toFloat() / src.height)
+            val w = maxOf(1, (src.width * scale).roundToInt())
+            val h = maxOf(1, (src.height * scale).roundToInt())
+            val scaled = smoothScale(src, w, h)
+            val square = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+            Canvas(square).drawBitmap(scaled, (size - w) / 2f, (size - h) / 2f, null)
+            val bytes = ByteArrayOutputStream()
+            requireOk(square.compress(Bitmap.CompressFormat.PNG, 100, bytes))
+            pngs.add(Pair(size, bytes.toByteArray()))
+        }
+        writeIco(pngs, out)
     }
 
     private fun requireOk(ok: Boolean) {

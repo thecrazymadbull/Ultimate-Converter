@@ -2,6 +2,7 @@ package com.ultimateconverter.app
 
 import android.content.Context
 import android.net.Uri
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
@@ -97,7 +98,9 @@ object Converter {
     fun friendly(e: Throwable): String = when {
         e is OutOfMemoryError -> "Not enough memory for this file - try a smaller one"
         e.javaClass.simpleName == "ExportException" ->
-            "This phone couldn't convert that video (unsupported video format?)"
+            "This phone couldn't convert that file (unsupported format?)"
+        e is UnsatisfiedLinkError || e is ExceptionInInitializerError ->
+            "This format isn't supported on this phone"
         e is SecurityException -> e.message ?: "Permission problem"
         else -> e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
     }
@@ -114,7 +117,8 @@ object Converter {
             throw UnsupportedConversion(
                 when {
                     job.kind == Kind.PDF && t == Target.PDF -> "Already a PDF"
-                    job.kind == Kind.VIDEO -> "Videos can only become MP4 or audio"
+                    job.kind == Kind.VIDEO -> "Videos can become MP4, MOV, GIF or audio"
+                    job.kind == Kind.AUDIO -> "Sound files can only become audio (M4A or WAV)"
                     job.kind == Kind.PDF -> "A PDF can only become pictures"
                     else -> "Photos can't become ${t.label}"
                 },
@@ -128,7 +132,7 @@ object Converter {
                     listOf(convertImage(ctx, job, o, sink))
                 }
             Kind.PDF -> pdfToImages(ctx, job, o, sink, progress)
-            Kind.VIDEO -> listOf(convertVideo(ctx, job, o, sink, progress))
+            Kind.VIDEO, Kind.AUDIO -> listOf(convertVideo(ctx, job, o, sink, progress))
         }
     }
 
@@ -208,7 +212,7 @@ object Converter {
         }
     }
 
-    // ------------------------------------------------------------ video
+    // ------------------------------------------------------------ video / audio
     private suspend fun convertVideo(
         ctx: Context,
         job: FileJob,
@@ -216,12 +220,21 @@ object Converter {
         sink: OutputSink,
         progress: (Float) -> Unit,
     ): Uri {
-        val audioOnly = o.target == Target.M4A
-        val tmp = File(ctx.cacheDir, "convert_${job.id}.${o.target.ext}")
+        val t = o.target
+        if (t == Target.GIF) return videoToGif(ctx, job, o, sink, progress)
+
+        // MOV is the same H.264 video in a QuickTime-style name; the phone writes MP4 first
+        val workExt = if (t == Target.MOV) "mp4" else t.ext
+        val tmp = File(ctx.cacheDir, "convert_${job.id}.$workExt")
         try {
-            val bitrate = if (audioOnly) null else VideoEngine.pickBitrate(ctx, job.uri, o.quality, o.lossless)
-            VideoEngine.convert(ctx, job.uri, tmp, audioOnly, bitrate, progress)
-            val uri = sink.create(stemOf(job.name) + "." + o.target.ext, o.target.mime, o.target.cat, null)
+            if (t == Target.WAV) {
+                AudioEngine.toWav(ctx, job.uri, tmp, progress)
+            } else {
+                val audioOnly = t == Target.M4A
+                val bitrate = if (audioOnly) null else VideoEngine.pickBitrate(ctx, job.uri, o.quality, o.lossless)
+                VideoEngine.convert(ctx, job.uri, tmp, audioOnly, bitrate, progress)
+            }
+            val uri = sink.create(stemOf(job.name) + "." + t.ext, t.mime, t.cat, null)
             try {
                 tmp.inputStream().use { input -> sink.openStream(uri).use { out -> input.copyTo(out) } }
                 sink.finish(uri)
@@ -233,5 +246,29 @@ object Converter {
         } finally {
             tmp.delete()
         }
+    }
+
+    private suspend fun videoToGif(
+        ctx: Context,
+        job: FileJob,
+        o: Options,
+        sink: OutputSink,
+        progress: (Float) -> Unit,
+    ): Uri {
+        val uri = sink.create(stemOf(job.name) + ".gif", "image/gif", OutCat.IMAGE, null)
+        try {
+            var note: String? = null
+            sink.openStream(uri).use { raw ->
+                val out = BufferedOutputStream(raw, 1 shl 16)
+                note = GifVideo.write(ctx, job.uri, out, o.gifSize.maxSide, progress)
+                out.flush()
+            }
+            sink.finish(uri)
+            note?.let { job.message = it }
+        } catch (e: Throwable) {
+            sink.abort(uri)
+            throw e
+        }
+        return uri
     }
 }

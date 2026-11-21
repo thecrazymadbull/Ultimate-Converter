@@ -11,8 +11,10 @@ android {
         applicationId = "com.ultimateconverter.app"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
+        // keep the app small: AVIF ships native code, only for real phones
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
     buildTypes {
@@ -59,4 +61,7 @@ dependencies {
     implementation("androidx.media3:media3-common:1.3.1")
     implementation("androidx.media3:media3-transformer:1.3.1")
     implementation("androidx.media3:media3-effect:1.3.1")
+
+    // AVIF picture writing
+    implementation("io.github.awxkee:avif-coder:2.2.1")
 }

@@ -39,6 +39,7 @@ class PdfHandle(
 object MediaIO {
     private val imageExts = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "avif")
     private val videoExts = setOf("mp4", "mov", "mkv", "webm", "3gp", "avi", "m4v")
+    private val audioExts = setOf("mp3", "m4a", "aac", "wav", "ogg", "oga", "opus", "flac", "amr", "wma")
 
     fun queryMeta(ctx: Context, uri: Uri): FileMeta {
         var name: String? = null
@@ -67,8 +68,11 @@ object MediaIO {
             m == "application/pdf" || ext == "pdf" -> Kind.PDF
             m.startsWith("image/") -> Kind.IMAGE
             m.startsWith("video/") -> Kind.VIDEO
+            m.startsWith("audio/") -> Kind.AUDIO
+            m == "application/ogg" -> Kind.AUDIO
             ext in imageExts -> Kind.IMAGE
             ext in videoExts -> Kind.VIDEO
+            ext in audioExts -> Kind.AUDIO
             else -> null
         }
     }
@@ -228,6 +232,10 @@ object MediaIO {
                     val f = videoFacts(ctx, job.uri)
                     videoFrame(ctx, job.uri, maxSide) to "${f.width} × ${f.height} · ${formatDuration(f.durationMs)}"
                 }
+                Kind.AUDIO -> {
+                    val f = videoFacts(ctx, job.uri)
+                    null to formatDuration(f.durationMs)
+                }
             }
         } catch (ignored: Throwable) {
             null to "No preview"
@@ -241,6 +249,7 @@ object MediaIO {
                 Kind.IMAGE -> decodeImage(ctx, job.uri, 1400).bitmap
                 Kind.PDF -> openPdf(ctx, job.uri).use { h -> renderPdfPage(h, 0, 2f, 1400) }
                 Kind.VIDEO -> videoFrame(ctx, job.uri, 1400)
+                Kind.AUDIO -> null
             }
         } catch (ignored: Throwable) {
             null

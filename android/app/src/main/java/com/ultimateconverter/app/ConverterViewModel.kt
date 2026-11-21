@@ -30,6 +30,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
     var pdfName by mutableStateOf("combined")
     var pageSize by mutableStateOf(PageSize.MATCH)
     var dpi by mutableIntStateOf(200)
+    var gifSize by mutableStateOf(GifSize.MEDIUM)
     var outputTree by mutableStateOf<Uri?>(null)
 
     var converting by mutableStateOf(false)
@@ -59,6 +60,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     val hasPdfInput: Boolean get() = jobs.any { it.kind == Kind.PDF }
+    val hasVideoInput: Boolean get() = jobs.any { it.kind == Kind.VIDEO }
     val hasImageInput: Boolean get() = jobs.any { it.kind == Kind.IMAGE }
 
     /** The ▲▼ buttons only matter when photos are being merged into one PDF. */
@@ -85,7 +87,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
         ensureTarget()
         fresh.forEach { loadThumb(it) }
         statusText = if (unsupported > 0) {
-            "$unsupported file${if (unsupported == 1) "" else "s"} skipped (not a photo, video or PDF)"
+            "$unsupported file${if (unsupported == 1) "" else "s"} skipped (not a photo, video, sound or PDF)"
         } else {
             ""
         }
@@ -132,6 +134,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------ output folder
+    // the property above already generates a setOutputTree(), so give this one another JVM name
     @JvmName("applyOutputTree")
     fun setOutputTree(uri: Uri?) {
         outputTree = uri
@@ -148,7 +151,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
     fun start() {
         if (converting || jobs.isEmpty()) return
         saveSettings()
-        val options = Options(target, quality, lossless, combinePdf, pdfName, pageSize, dpi)
+        val options = Options(target, quality, lossless, combinePdf, pdfName, pageSize, dpi, gifSize)
         val list = jobs.toList()
         for (j in list) {
             j.state = JobState.QUEUED
@@ -195,6 +198,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
             pdfName = prefs.getString("pdfName", "combined") ?: "combined"
             prefs.getString("pageSize", null)?.let { n -> PageSize.values().firstOrNull { it.name == n }?.let { pageSize = it } }
             dpi = prefs.getInt("dpi", 200).takeIf { it in DPI_CHOICES } ?: 200
+            prefs.getString("gifSize", null)?.let { n -> GifSize.values().firstOrNull { it.name == n }?.let { gifSize = it } }
             val saved = prefs.getString("tree", null)
             if (saved != null) {
                 val uri = Uri.parse(saved)
@@ -216,6 +220,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
                 .putString("pdfName", pdfName)
                 .putString("pageSize", pageSize.name)
                 .putInt("dpi", dpi)
+                .putString("gifSize", gifSize.name)
                 .putString("tree", outputTree?.toString())
                 .apply()
         } catch (e: Exception) {

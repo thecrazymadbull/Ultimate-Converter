@@ -8,9 +8,10 @@ screen, one thumb).
 
 | You add | You can convert to |
 |---|---|
-| Photos (JPEG, PNG, WEBP, GIF*, BMP, HEIC, AVIF**) | PNG, JPEG, WEBP, BMP, or **PDF** |
-| PDFs | one picture per page — PNG, JPEG, WEBP, BMP (150 / 200 / 300 DPI) |
-| Videos | MP4 (H.264), or **audio only** (M4A) |
+| Photos (JPEG, PNG, WEBP, GIF, BMP, HEIC, AVIF) | PNG, JPEG, WEBP, **AVIF**, **GIF**, **TIFF**, BMP, **ICO**, or PDF |
+| PDFs | one picture per page — PNG, JPEG, WEBP, AVIF, GIF, TIFF, BMP (150 / 200 / 300 DPI) |
+| Videos | MP4, **MOV**, **animated GIF**, or audio only (M4A, **WAV**) |
+| Sound files (MP3, M4A, WAV, OGG, FLAC…) | **M4A** or **WAV** |
 
 \* animated GIFs use their first frame. \*\* AVIF/HEIC need a recent Android (HEIC 9+, AVIF 12+).
 

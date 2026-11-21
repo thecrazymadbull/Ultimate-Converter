@@ -77,7 +77,7 @@ import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-const val APP_VERSION = "1.0"
+const val APP_VERSION = "1.1"
 
 private val DarkColors = darkColorScheme(
     primary = Color(0xFF7C8CFF),
@@ -139,7 +139,7 @@ fun ConverterApp(vm: ConverterViewModel) {
     val addPhotos = {
         photoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
     }
-    val addFiles = { filePicker.launch(arrayOf("image/*", "video/*", "application/pdf")) }
+    val addFiles = { filePicker.launch(arrayOf("image/*", "video/*", "audio/*", "application/pdf")) }
 
     Scaffold(
         containerColor = cs.background,
@@ -272,6 +272,7 @@ private fun JobCard(vm: ConverterViewModel, job: FileJob, onOpenPreview: () -> U
                                 Kind.IMAGE -> "🖼"
                                 Kind.VIDEO -> "🎞"
                                 Kind.PDF -> "📄"
+                                Kind.AUDIO -> "🎵"
                             },
                             fontSize = 28.sp,
                         )
@@ -296,7 +297,7 @@ private fun JobCard(vm: ConverterViewModel, job: FileJob, onOpenPreview: () -> U
                             statusColor = cs.onSurfaceVariant
                         }
                         JobState.CONVERTING -> { statusText = "Converting…"; statusColor = cs.primary }
-                        JobState.DONE -> { statusText = "✓ Done"; statusColor = GoodGreen }
+                        JobState.DONE -> { statusText = if (job.message.isBlank()) "✓ Done" else "✓ Done - ${job.message}"; statusColor = GoodGreen }
                         JobState.ERROR -> { statusText = job.message; statusColor = cs.error }
                         JobState.SKIPPED -> { statusText = job.message; statusColor = cs.onSurfaceVariant }
                         JobState.CANCELLED -> { statusText = "Cancelled"; statusColor = cs.onSurfaceVariant }
@@ -392,11 +393,30 @@ private fun OptionsCard(vm: ConverterViewModel, onChooseFolder: () -> Unit) {
 
             // --- quality ---
             when (target) {
-                Target.PNG, Target.BMP -> Note("${target.label} is always lossless - nothing to set.")
+                Target.PNG, Target.BMP, Target.TIFF, Target.ICO, Target.WAV ->
+                    Note("${target.label} is always full quality - nothing to set.")
+                Target.GIF -> {
+                    if (vm.hasVideoInput) {
+                        SectionTitle("Animated GIF size")
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            for (g in GifSize.values()) {
+                                FilterChip(
+                                    selected = vm.gifSize == g,
+                                    onClick = { vm.gifSize = g },
+                                    label = { Text(g.label, fontSize = 15.sp) },
+                                    modifier = Modifier.height(44.dp),
+                                )
+                            }
+                        }
+                        Note("Videos become an animated GIF (first 30 seconds, 10 pictures a second). GIF has only 256 colours.")
+                    } else {
+                        Note("GIF has only 256 colours, so photos can look a little grainy.")
+                    }
+                }
                 Target.M4A -> Note("The sound is saved as AAC (M4A).")
                 else -> {
                     SwitchRow(
-                        if (target == Target.MP4) "Highest quality (bigger file)" else "Lossless (bigger file)",
+                        if (target == Target.MP4 || target == Target.MOV) "Highest quality (bigger file)" else "Lossless (bigger file)",
                         vm.lossless,
                     ) { vm.lossless = it }
                     Column {
