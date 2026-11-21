@@ -132,6 +132,7 @@ class ConverterViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------ output folder
+    @JvmName("applyOutputTree")
     fun setOutputTree(uri: Uri?) {
         outputTree = uri
         saveSettings()
