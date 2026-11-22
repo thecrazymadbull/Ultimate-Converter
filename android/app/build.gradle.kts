@@ -63,5 +63,6 @@ dependencies {
     implementation("androidx.media3:media3-effect:1.3.1")
 
     // AVIF picture writing
-    implementation("io.github.awxkee:avif-coder:2.2.1")
+    // runtimeOnly: the library is newer than this build's Kotlin, so the app only calls it by name at run time
+    runtimeOnly("io.github.awxkee:avif-coder:2.2.1")
 }
