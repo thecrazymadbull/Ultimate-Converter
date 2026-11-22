@@ -66,3 +66,12 @@ dependencies {
     // runtimeOnly: the library is newer than this build's Kotlin, so the app only calls it by name at run time
     runtimeOnly("io.github.awxkee:avif-coder:2.2.1")
 }
+
+// Keep Kotlin's base library at the version this build understands (the AVIF library asks for a newer one)
+configurations.all {
+    resolutionStrategy {
+        force("org.jetbrains.kotlin:kotlin-stdlib:1.9.24")
+        force("org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.9.24")
+        force("org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.24")
+    }
+}
